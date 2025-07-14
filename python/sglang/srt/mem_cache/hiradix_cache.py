@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 logger = logging.getLogger(__name__)
 
 
+# 使用分级存储的radix cache
 class HiRadixCache(RadixCache):
 
     def __init__(

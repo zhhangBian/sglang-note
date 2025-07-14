@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
 
 
+# 用于判断节点的运行费模式
 class DisaggregationMode(Enum):
     NULL = "null"
     PREFILL = "prefill"

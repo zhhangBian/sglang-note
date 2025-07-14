@@ -46,17 +46,22 @@ GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 
 
+# 一级内存池，只跟踪每个请求中token的cache在二级内存池中的位置
+# 跟踪每个请求使用的token位置，具体的kv cache在二级内存池
 class ReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
     def __init__(
         self,
+        # running阶段的最大请求数量
         size: int,
+        # 最大请求上下文长度
         max_context_len: int,
         device: str,
         enable_memory_saver: bool,
     ):
 
+        # 创建内存管理：给特定区域的显存打上相应的tag标记
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -64,19 +69,28 @@ class ReqToTokenPool:
         self.size = size
         self.max_context_len = max_context_len
         self.device = device
+        # 将相应的显存标记为KVC类（与权重类相对应）
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # 得到大张量，初始化显存
+            # 以size为响应的KVC的分配总量
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
 
+        # 利用id进行标记空闲的slot
         self.free_slots = list(range(size))
 
+    # indices : tuple[int, slice]
+    #     int是该req的序号, slice是切片索引, 切出对应长度的tensor并使用value进行赋值
+    # values : torch.Tensor
+    #     该req此时要记录的token对应的kv cache tensor的indices
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
 
+    # 获取空闲大小的slot，返回分配的slot idx
     def alloc(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
             return None
@@ -86,6 +100,7 @@ class ReqToTokenPool:
 
         return select_index
 
+    # 释放slot：实质是将空闲的slot加入到空闲slot列表中
     def free(self, free_index: Union[int, List[int]]):
         if isinstance(free_index, (int,)):
             self.free_slots.append(free_index)
@@ -96,10 +111,12 @@ class ReqToTokenPool:
         self.free_slots = list(range(self.size))
 
 
+# 具体的二级内存池，根据不同的Attention创建对应的cache tensor
 class KVCache(abc.ABC):
     @abc.abstractmethod
     def __init__(
         self,
+        # 最大token数量
         size: int,
         page_size: int,
         dtype: torch.dtype,
@@ -173,6 +190,7 @@ class KVCache(abc.ABC):
         raise NotImplementedError()
 
 
+# 最为原始的MHA KVC池
 class MHATokenToKVPool(KVCache):
 
     def __init__(
@@ -226,6 +244,7 @@ class MHATokenToKVPool(KVCache):
         )
         self.mem_usage = (k_size + v_size) / GB
 
+    # 创建相应的cache tensor
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -235,6 +254,7 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # K池
                 self.k_buffer = [
                     torch.zeros(
                         (self.size + self.page_size, self.head_num, self.head_dim),
@@ -243,6 +263,7 @@ class MHATokenToKVPool(KVCache):
                     )
                     for _ in range(self.layer_num)
                 ]
+                # V池
                 self.v_buffer = [
                     torch.zeros(
                         (self.size + self.page_size, self.head_num, self.head_dim),

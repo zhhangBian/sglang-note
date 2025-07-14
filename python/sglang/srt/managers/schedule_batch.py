@@ -1127,11 +1127,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    # 为extend的执行做准备，分配一二级内存，更新一级内存池
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
         # Allocate req slots
         bs = len(self.reqs)
+        # 获取相应batch size的slot
         req_pool_indices = self.alloc_req_slots(bs)
 
         # Init tensors

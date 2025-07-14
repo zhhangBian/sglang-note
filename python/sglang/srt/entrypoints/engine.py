@@ -721,6 +721,8 @@ def _launch_subprocesses(
 
         for pp_rank in pp_rank_range:
             for tp_rank in tp_rank_range:
+                # reader和writer是两个进程之间的通信管道，用于多线程用户同步状态
+                # scheduler进程初始化完成后，通过writer发送 ready 状态
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
                     server_args.base_gpu_id

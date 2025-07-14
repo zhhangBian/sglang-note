@@ -39,19 +39,24 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
+# 使用radix cache进行请求的复用
+# 以树的形式进行管理
 
 class TreeNode:
 
     counter = 0
 
     def __init__(self, id: Optional[int] = None):
+        # 树关系的维护
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
+        # 自身的信息
         self.key: List[int] = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
 
+        # 对访问信息的维护
         self.hit_count = 0
         # indicating the node is loading KV cache from host
         self.loading = False
@@ -61,6 +66,7 @@ class TreeNode:
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
+    # 利用是否还有信息来判断节点是否已经被evict：直接删去节点是粗暴的方式
     @property
     def evicted(self):
         return self.value is None
@@ -69,10 +75,12 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
+    # 由于LRU的方式，使用最近的访问时间来决定优先级
     def __lt__(self, other: "TreeNode"):
         return self.last_access_time < other.last_access_time
 
 
+# 用于判断两个list最大match前缀的工具函数
 def _key_match_page_size1(key0: List, key1: List):
     i = 0
     for k0, k1 in zip(key0, key1):
@@ -82,6 +90,7 @@ def _key_match_page_size1(key0: List, key1: List):
     return i
 
 
+# 以步长page判断前缀的匹配：对于page之间的内容进行了忽略
 def _key_match_paged(key0: List, key1: List, page_size: int):
     min_len = min(len(key0), len(key1))
 
@@ -94,6 +103,7 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
     return i
 
 
+# 以树的形式记录了请求的历史信息
 class RadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -125,6 +135,7 @@ class RadixCache(BasePrefixCache):
 
     ##### Public API #####
 
+    # 对整体信息进行重置
     def reset(self):
         self.root_node = TreeNode()
         self.root_node.key = []
@@ -134,6 +145,12 @@ class RadixCache(BasePrefixCache):
         self.protected_size_ = 0
         self._record_all_cleared_event()
 
+    # 匹配前缀，返回一个元组
+    # 元组中包含：
+    # 1. 匹配到的token的索引指针张量
+    # 2. 在device上最后一个匹配到的节点
+    # 3. 在host上最后一个匹配到的节点（如果没有开启分层存储，那么host和device的最后一个匹配到的节点是同一个）
+    # 4. 在device上匹配到的token的索引（如果开启分层存储，那么0）
     def match_prefix(self, key: List[int], **kwargs) -> MatchResult:
         """Find the matching prefix from the radix tree.
         Args:
@@ -156,6 +173,7 @@ class RadixCache(BasePrefixCache):
                 last_host_node=self.root_node,
             )
 
+        # 如果page_size不为1，那么需要对key进行page对齐
         if self.page_size != 1:
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
@@ -175,10 +193,12 @@ class RadixCache(BasePrefixCache):
         if self.disable:
             return 0
 
+        # 如果value为空，那么将key作为value
         if value is None:
             value = [x for x in key]
         return self._insert_helper(self.root_node, key, value)
 
+    # 缓存请求完成后的信息
     def cache_finished_req(self, req: Req):
         """Cache request when it finishes."""
         if self.disable:
@@ -195,6 +215,7 @@ class RadixCache(BasePrefixCache):
         ]
 
         if self.page_size != 1:
+            # 按照page进行对齐
             page_aligned_len = len(kv_indices) // self.page_size * self.page_size
             page_aligned_kv_indices = kv_indices[:page_aligned_len].to(
                 dtype=torch.int64, copy=True
@@ -205,9 +226,11 @@ class RadixCache(BasePrefixCache):
             page_aligned_kv_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
         # Radix Cache takes one ref in memory pool
+        # 插入到radix tree中
         new_prefix_len = self.insert(
             token_ids[:page_aligned_len], page_aligned_kv_indices
         )
+        # 释放掉多余的kv_indices
         self.token_to_kv_pool_allocator.free(
             kv_indices[len(req.prefix_indices) : new_prefix_len]
         )
@@ -293,6 +316,7 @@ class RadixCache(BasePrefixCache):
 
             self._record_remove_event(x)
 
+    # 增加锁引用
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -307,6 +331,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
+    # 减少锁引用
     def dec_lock_ref(self, node: TreeNode):
         if self.disable:
             return 0
@@ -321,6 +346,7 @@ class RadixCache(BasePrefixCache):
             node = node.parent
         return delta
 
+    # 获取可释放的size
     def evictable_size(self):
         return self.evictable_size_
 
@@ -341,6 +367,7 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    # 匹配前缀的辅助函数
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.monotonic()
 
@@ -366,11 +393,16 @@ class RadixCache(BasePrefixCache):
 
         return value, node
 
+    # 将节点进行split
     def _split_node(self, key, child: TreeNode, split_len: int):
         # new_node -> child
+        # 记录删除事件
         self._record_remove_event(child)
+        # 创建新的节点
         new_node = TreeNode()
+        # 更新children
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        # 更新parent
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
@@ -385,6 +417,7 @@ class RadixCache(BasePrefixCache):
 
         return new_node
 
+    # 实际的insert函数
     def _insert_helper(self, node: TreeNode, key: List, value):
         node.last_access_time = time.monotonic()
         if len(key) == 0:
@@ -393,14 +426,18 @@ class RadixCache(BasePrefixCache):
         child_key = self.get_child_key_fn(key)
 
         total_prefix_length = 0
+        # 可以匹配到子节点
         while len(key) > 0 and child_key in node.children.keys():
+            # 匹配到子节点，更新node
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = self.key_match_fn(node.key, key)
+            # 更新total_prefix_length
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
 
+            # 如果匹配到的长度小于子节点的长度，那么需要进行split，在新的节点中插入
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
@@ -408,13 +445,17 @@ class RadixCache(BasePrefixCache):
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
+        # 如果key不为空，那么需要插入到radix tree中
         if len(key):
+            # 创建新的节点
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = value
             node.children[child_key] = new_node
+            # 更新evictable_size_：由于是叶子节点，故一定是可以evict的
             self.evictable_size_ += len(value)
+            # 记录存储事件
             self._record_store_event(new_node)
         return total_prefix_length
 

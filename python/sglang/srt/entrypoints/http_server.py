@@ -108,6 +108,7 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
+# 用于全局共享的信息
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
@@ -876,6 +877,7 @@ def _create_error_response(e):
     )
 
 
+# 所有的推理框架，无非都在做两个事情，输入文本，模型执行，然后返回
 def launch_server(
     server_args: ServerArgs,
     pipe_finish_writer: Optional[multiprocessing.connection.Connection] = None,
