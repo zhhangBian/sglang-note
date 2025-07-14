@@ -456,6 +456,9 @@ class Scheduler(
             self.tree_cache,
             self.enable_hierarchical_cache,
         )
+        # 类似 TCP 拥塞避免机制的动态调整策略，一步一步加大拥塞窗口来试探到网络的极限
+        # - 当一个批次成功执行时，Scheduler 会逐步增加下一批次的规模，以获得更高的吞吐量；
+        # - 而当一个批次失败时，Scheduler 则会减少下一批次的规模，以避免资源过载
         assert (
             server_args.schedule_conservativeness >= 0
         ), "Invalid schedule_conservativeness"
@@ -562,6 +565,7 @@ class Scheduler(
     def init_memory_pool_and_cache(self):
         server_args = self.server_args
 
+        # 一级内存池
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
@@ -758,18 +762,23 @@ class Scheduler(
             # The prefill requests that are in the middle of kv sending
             self.disagg_prefill_inflight_queue: List[Req] = []
 
+    # 正常调度方式：调度的核心
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            # 接收请求
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
 
+            # 获取下一个要运行的batch
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
             if batch:
+                # 运行batch
                 result = self.run_batch(batch)
+                # 处理batch结果
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -958,6 +967,7 @@ class Scheduler(
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
 
+    # 接收请求
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
         if self.pp_rank == 0:
@@ -1036,6 +1046,7 @@ class Scheduler(
             )
         return recv_reqs
 
+    # 处理请求
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
@@ -1464,6 +1475,7 @@ class Scheduler(
             self.metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
+    # 获取下一个要运行的batch
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
@@ -2708,6 +2720,7 @@ def _import_static_state(model, static_params):
         self_named_buffers[name][...] = tensor
 
 
+# 启动scheduler进程
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -2717,6 +2730,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # 相应的前缀标识符
     # Generate the prefix
     prefix = ""
     if dp_rank is not None:
@@ -2751,6 +2765,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(server_args, port_args, gpu_id, tp_rank, pp_rank, dp_rank)
+        # 初始化完成后发送 ready 状态
         pipe_writer.send(
             {
                 "status": "ready",
@@ -2760,6 +2775,7 @@ def run_scheduler_process(
         )
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
 
+        # 根据节点的运行费模式，选择不同的调度方式
         if disaggregation_mode == DisaggregationMode.NULL:
             if server_args.pp_size > 1:
                 scheduler.event_loop_pp()

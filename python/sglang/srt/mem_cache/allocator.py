@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+# 一级内存池和二级内存池并不直接交互，而是通过TokenToKVPoolAllocator进行交互
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(
