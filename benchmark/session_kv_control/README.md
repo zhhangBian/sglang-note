@@ -1,6 +1,6 @@
 # Session KV 实验脚本
 
-社区汇报见 [完整英文报告](COMMUNITY_REPORT.md)及[中文摘要](COMMUNITY_REPORT.zh-CN.md)，覆盖实现设计、测试、五轮独立性能结果、资源成本、负结果与复现入口。
+社区汇报见 [完整中文报告](COMMUNITY_REPORT.zh-CN.md)及[完整英文报告](COMMUNITY_REPORT.md)，覆盖实现设计、测试、五轮独立性能结果、资源成本、负结果与复现入口。
 
 0.8 长测后的优化与评估计划见 [Session KV 生命周期优化实施计划](../../SESSION_KV_OPTIMIZATION_PLAN.zh-CN.md)。持续任务入口见 [生命周期配对实验](LIFECYCLE_BENCH.md)，覆盖按需、固定预取、Router 生命周期策略，以及有界异步收尾、预测误差、共享前缀和模拟 rollout 有效吞吐。各脚本的测量范围以对应说明为准。
 

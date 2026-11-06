@@ -1,5 +1,7 @@
 # Session-aware KV cache orchestration: implementation and evaluation
 
+[完整中文版本](COMMUNITY_REPORT.zh-CN.md)
+
 Implementation update for [SGLang RFC #45189](https://github.com/sgl-project/sglang/issues/45189). Prepared on November 6, 2026. This report describes the `rfc-kvc` implementation and its recorded experiments; the interfaces remain subject to upstream review.
 
 We implemented session and branch tracking in the Router, explicit `PREFETCH`, `DEMOTE`, and `PIN` operations, HiCache execution integration, and bounded lifecycle scheduling. In five held-out paired runs with Qwen3-8B, Mooncake TCP, `mem-fraction-static=0.8`, and a logical working set 1.51 times the target L2 capacity, the lifecycle strategy achieved:
