@@ -1,5 +1,7 @@
 # Session KV 实验脚本
 
+社区汇报见 [完整英文报告](COMMUNITY_REPORT.md)及[中文摘要](COMMUNITY_REPORT.zh-CN.md)，覆盖实现设计、测试、五轮独立性能结果、资源成本、负结果与复现入口。
+
 0.8 长测后的优化与评估计划见 [Session KV 生命周期优化实施计划](../../SESSION_KV_OPTIMIZATION_PLAN.zh-CN.md)。持续任务入口见 [生命周期配对实验](LIFECYCLE_BENCH.md)，覆盖按需、固定预取、Router 生命周期策略，以及有界异步收尾、预测误差、共享前缀和模拟 rollout 有效吞吐。各脚本的测量范围以对应说明为准。
 
 `session_kv_bench.py` 对已运行的两个 SGLang Engine 发 HTTP 请求，比较普通 HiCache 按需恢复与独立 L3→L2 PREFETCH。脚本不启动或停止服务，不安装依赖，不修改服务配置。两个 Engine 使用同一权重 namespace、相同 layout、page size、模型、缓存容量与负载配置，共享同一个 Mooncake。A 产生 KV，B 恢复请求。

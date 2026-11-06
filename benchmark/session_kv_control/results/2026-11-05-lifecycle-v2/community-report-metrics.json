@@ -1,0 +1,162 @@
+{
+  "analysis_date": "2026-11-06",
+  "analysis_type": "derived from the existing five-pair experiment; no new serving run",
+  "experiment_router_and_benchmark_source": "565de9e13240bc4bcd941d389de7c0f98fb8c856",
+  "request_scope": "all completed generation responses, including slow responses; 8960 per arm",
+  "quantile_method": "linear interpolation at (n-1)*p, identical to bench_statistics.quantile",
+  "e2e_definition": "generation request dispatch to final output; excludes prior tool wait and task registration",
+  "task_latency_definition": "resume_task entry to final task row; asynchronous control drain is measured at arm level",
+  "source_files": [
+    {
+      "archive_path": "cells/formal-v2-pair-0/b0-on_demand.json.gz",
+      "original_sha256": "889eaf6be7bf0ebc8e191e5afd6864ed215bbf582012cdd4ce98cefad7f3c701",
+      "original_bytes": 7265067
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-0/b0-lifecycle.json.gz",
+      "original_sha256": "8df06a005892b0f23cf641c439afab8139ddc3a4da513654c0cbc19afa45662e",
+      "original_bytes": 10618481
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-1/b0-on_demand.json.gz",
+      "original_sha256": "6bfe2a513375b615f81bb059c17bca9733f909b46d66458e45c6c548ae325201",
+      "original_bytes": 7246739
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-1/b0-lifecycle.json.gz",
+      "original_sha256": "9c0937f10ceacc7129682c095aefcfb1680871138a78d03bbff26607892e9018",
+      "original_bytes": 10820223
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-2/b0-on_demand.json.gz",
+      "original_sha256": "a7a86c15cc5aa4b13a47d16d059fe72873761839ee8314ed3837af26260af863",
+      "original_bytes": 7260779
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-2/b0-lifecycle.json.gz",
+      "original_sha256": "c6981d3224aba3d4e2bf87c7b02fcc59c9d9d2c4c39eb2ba7f2ef9a6bc670aa2",
+      "original_bytes": 10724753
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-3/b0-on_demand.json.gz",
+      "original_sha256": "ed1d9650ac4a32c5d6015ae725cc8fad22e6c7bf899b17f856ce10a3164ccfc1",
+      "original_bytes": 7264720
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-3/b0-lifecycle.json.gz",
+      "original_sha256": "023d53b7b26181953099ef1309d6e03a9f4c3edda87b3d61da0f9cbfd4de03d8",
+      "original_bytes": 10997054
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-4/b0-on_demand.json.gz",
+      "original_sha256": "5420a464ce5ac15f942acf8059cd825d0d9e5066b806afb10f9b33378a62bc8b",
+      "original_bytes": 7251921
+    },
+    {
+      "archive_path": "cells/formal-v2-pair-4/b0-lifecycle.json.gz",
+      "original_sha256": "782839bb9b585b5e35655e782c8f4d8cdecb95c3f9f635ae4e2f232442220106",
+      "original_bytes": 10579582
+    }
+  ],
+  "arms": {
+    "on_demand": {
+      "ttft_ms": {
+        "n": 8960,
+        "mean": 11077.079264775759,
+        "p95": 25711.567356484007,
+        "p99": 31426.35235860943
+      },
+      "e2e_ms": {
+        "n": 8960,
+        "mean": 15200.764965278047,
+        "p95": 32504.141670558598,
+        "p99": 38774.844145085655
+      },
+      "task_latency_ms": {
+        "n": 8960,
+        "mean": 18387.492399863862,
+        "p95": 35726.20266708545,
+        "p99": 42087.80745314433
+      },
+      "control_backpressure_ms": {
+        "n": 8960,
+        "mean": 0.010198847927053325,
+        "p95": 0.012517953291535378,
+        "p99": 0.01649670302867889
+      },
+      "dispatch_lateness_ms": {
+        "n": 8960,
+        "mean": 0.6162095740104893,
+        "p95": 2.299220161512493,
+        "p99": 5.06927402690053
+      },
+      "drain_ms": [
+        2.9959985986351967,
+        1.788875088095665,
+        2.6331013068556786,
+        9.241752326488495,
+        43.6786999925971
+      ],
+      "policy_fallback": 0,
+      "strict_preparation_complete": 0
+    },
+    "lifecycle": {
+      "ttft_ms": {
+        "n": 8960,
+        "mean": 5658.763825360594,
+        "p95": 18917.56514683365,
+        "p99": 32483.30759353935
+      },
+      "e2e_ms": {
+        "n": 8960,
+        "mean": 9121.990542845535,
+        "p95": 22651.480819564305,
+        "p99": 36565.63348755239
+      },
+      "task_latency_ms": {
+        "n": 8960,
+        "mean": 14013.225355025914,
+        "p95": 27574.674310721417,
+        "p99": 41417.51375431195
+      },
+      "control_backpressure_ms": {
+        "n": 8960,
+        "mean": 0.009034276549105666,
+        "p95": 0.01211566850543022,
+        "p99": 0.01765116117894649
+      },
+      "dispatch_lateness_ms": {
+        "n": 8960,
+        "mean": 0.7195810105518571,
+        "p95": 1.9499759189784507,
+        "p99": 4.545971443876621
+      },
+      "drain_ms": [
+        36.78799606859684,
+        9.63744055479765,
+        19.494307227432728,
+        19.514651969075203,
+        17.76058878749609
+      ],
+      "policy_fallback": 5479,
+      "strict_preparation_complete": 1722
+    }
+  },
+  "change_percent_lifecycle_relative_to_on_demand": {
+    "ttft_ms": {
+      "mean": -48.91465800596898,
+      "p95": -26.42391307948415,
+      "p99": 3.3632768539883173
+    },
+    "e2e_ms": {
+      "mean": -39.989924430236215,
+      "p95": -30.312016698839873,
+      "p99": -5.697535879878613
+    },
+    "task_latency_ms": {
+      "mean": -23.789361538337516,
+      "p95": -22.81666605411169,
+      "p99": -1.592607786895539
+    }
+  }
+}
