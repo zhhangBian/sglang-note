@@ -8,7 +8,6 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertResult,
     MatchPrefixParams,
@@ -19,13 +18,15 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -40,14 +41,13 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
+    family = TREE_TOKEN
 
     def __init__(self, cache, params, slot):
         super().__init__(cache, params, slot)
@@ -59,6 +59,8 @@ class FullComponent(TreeComponent):
             if cache.enable_session_radix_cache
             else None
         )
+        # Kept across one eviction walk; without session refs no priority changes mid-walk.
+        self._host_eviction_heap: Optional[list] = None
 
     def _ensure_eviction_strategy(self) -> None:
         if self.session_ref_eviction_strategy is None:
@@ -229,7 +231,7 @@ class FullComponent(TreeComponent):
         if (
             lv is not None
             and lv.parent is not None
-            and lv.parent in self.tree_core.evictable_device_leaves
+            and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
             heapq.heappush(
                 self._evict_device_heap,
@@ -238,7 +240,7 @@ class FullComponent(TreeComponent):
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
             _, x = heapq.heappop(self._evict_device_heap)
-            if x not in self.tree_core.evictable_device_leaves:
+            if not self.tree_core._is_device_walk_candidate(x):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -247,6 +249,14 @@ class FullComponent(TreeComponent):
     def _evict_device_end(self) -> None:
         self._evict_device_heap = []
         self._evict_device_last_node = None
+        self._host_eviction_heap = None
+
+    def on_host_leaf_added(self, node: UnifiedTreeNode) -> None:
+        if self._host_eviction_heap is not None:
+            heapq.heappush(
+                self._host_eviction_heap,
+                (self.session_ref_eviction_strategy(node), node),
+            )
 
     def drive_host_eviction(
         self,
@@ -276,23 +286,48 @@ class FullComponent(TreeComponent):
             )
         if tracker[ct] >= num_tokens:
             return
-        leaf_key = self.session_ref_eviction_strategy
-        if priorities:
+        if not priorities:
+            if self._host_eviction_heap is None:
+                self._host_eviction_heap = [
+                    (self.session_ref_eviction_strategy(n), n)
+                    for n in self.tree_core.evictable_host_leaves
+                ]
+                heapq.heapify(self._host_eviction_heap)
+            heap = self._host_eviction_heap
+            try:
+                while tracker[ct] < num_tokens and heap:
+                    _, x = heapq.heappop(heap)
+                    if x not in self.tree_core.evictable_host_leaves:
+                        continue
+                    self.tree_core._evict_host_leaf(
+                        x,
+                        tracker,
+                        device_frees,
+                        host_frees,
+                        cache_actions=cache_actions,
+                    )
+            finally:
+                if not (
+                    self.is_evict_device_ongoing
+                    and not self.tree_core.enable_session_radix_cache
+                ):
+                    self._host_eviction_heap = None
+            return
 
-            def priority_key(node):
-                slot = int(node.component_data[ct].host_value[0])
-                priority = priorities.get(slot)
-                return (priority is not None, priority or 0)
+        def priority_key(node):
+            slot = int(node.component_data[ct].host_value[0])
+            priority = priorities.get(slot)
+            return (priority is not None, priority or 0)
 
-            def leaf_key(node):
-                return priority_key(node), 2, self.session_ref_eviction_strategy(node)
+        def leaf_key(node):
+            return priority_key(node), 2, self.session_ref_eviction_strategy(node)
 
         heap = [(leaf_key(n), n) for n in tree.evictable_host_leaves]
-        if priorities and reclaim_duplicates:
+        if reclaim_duplicates:
             # At the same priority retain duplicate-first ordering, including
             # the existing preference to spare imminent GPU demotions.
             heap.extend(
-                ((priority_key(n), n in tree.evictable_device_leaves, i), n)
+                ((priority_key(n), tree._is_device_walk_candidate(n), i), n)
                 for i, n in enumerate(tree.full_host_duplicates.values())
                 if tree._can_reclaim_full_host_duplicate(n)
             )
@@ -300,11 +335,7 @@ class FullComponent(TreeComponent):
         while tracker[ct] < num_tokens and heap:
             _, x = heapq.heappop(heap)
             if x not in tree.evictable_host_leaves:
-                if (
-                    priorities
-                    and reclaim_duplicates
-                    and tree._can_reclaim_full_host_duplicate(x)
-                ):
+                if reclaim_duplicates and tree._can_reclaim_full_host_duplicate(x):
                     tree._release_full_host_duplicate(
                         x, tracker, device_frees, host_frees, cache_actions
                     )
@@ -489,9 +520,16 @@ class FullComponent(TreeComponent):
 
             xfer = transfers[0]
             device_indices = xfer.device_indices
+            loaded = [
+                self.tree_core.node_by_id(nid) for nid in xfer.nodes_to_load or []
+            ]
+            chain_len = sum(len(n.component_data[ct].host_value) for n in loaded)
+            assert len(device_indices) == chain_len, (
+                f"load-back filled {len(device_indices)} device slots for a chain "
+                f"of {chain_len} host tokens"
+            )
             offset = 0
-            for nid in xfer.nodes_to_load or []:
-                n = self.tree_core.node_by_id(nid)
+            for n in loaded:
                 cd = n.component_data[ct]
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
@@ -534,9 +572,8 @@ class FullComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
-            if shortfall:
-                self.cache.evict(EvictParams(num_tokens=shortfall))
+            if not storage.units_fit(sub_pool, num_tokens):
+                self.cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None

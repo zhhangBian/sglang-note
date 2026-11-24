@@ -25,6 +25,7 @@ from sglang.srt.managers.kv_control.service import (
     parse_config,
 )
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -465,6 +466,7 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
             store.mem_pool_host = cache.host_pool_group.anchor_entry.host_pool
             store.storage_config = cache.cache_controller.storage_config
             store.config_prefix = "test"
+            store.unified_suffixes = None
             store.is_mla_backend = False
             store.should_split_heads = False
             store.mha_suffix = "0"
@@ -610,7 +612,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         )
                     )
             finally:
-                cache.release_aborted_request(request)
+                cache.finish(request, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -660,7 +662,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         return entered.is_set()
 
                     wait_for(service, started)
-                    cache.release_aborted_request(cancelled)
+                    cache.finish(cancelled, CacheRequestOutcome.ABORT)
                     self.assertEqual(cc.mem_pool_host.available_size(), 0)
                     self._ordinary_prefetch(cache, service, second, next_read)
                     self.assertTrue(queried.wait(5))
@@ -674,7 +676,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 self.assertTrue(
                     all(n.component_data[FULL].host_value is not None for n, _ in hot)
                 )
-                cache.release_aborted_request(next_read)
+                cache.finish(next_read, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -766,7 +768,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 borrowed = self._restore(
                                     service, scopes[2], "deferred-owner"
                                 )
-                                cache.release_aborted_request(requests[2])
+                                cache.finish(requests[2], CacheRequestOutcome.ABORT)
                             service.control.cancel(borrowed.ref)
                             self.assertEqual(
                                 wait(service, borrowed).status, Status.CANCELLED
@@ -888,7 +890,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             finally:
                 release.set()
                 for request in (first, staged, joined, demand):
-                    cache.release_aborted_request(request)
+                    cache.finish(request, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             self.assertEqual(calls, [first, staged, shared_handle, demand, hint_handle])
 
@@ -1075,8 +1077,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertGreaterEqual(stats[key], 0)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
-                cache.release_aborted_request(ordinary)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
+                cache.finish(ordinary, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1222,7 +1224,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertEqual((len(queries), len(gets)), (2, 2))
                 finally:
                     release.set()
-                    cache.release_aborted_request(demand)
+                    cache.finish(demand, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
                 cache.sanity_check()
 
@@ -1268,7 +1270,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(
                         service.control.cancel(queued.ref).status, Status.CANCELLING
                     )
-                    cache.release_aborted_request(demand)
+                    cache.finish(demand, CacheRequestOutcome.ABORT)
                     self.assertEqual(wait(service, queued).status, Status.CANCELLED)
                     self.assertEqual(len(queries), 1)
                     self.assertFalse(reads.demands)
@@ -1277,7 +1279,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(len(queries), 1)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1343,7 +1345,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertFalse(cache.has_ongoing_prefetch(demand))
                     self.assertEqual(cc.mem_pool_host.available_size(), 0)
             finally:
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
                 self._pin_pressure(service, pressure, mode="release")
             assert_retired(cache, service)
             cache.sanity_check()
@@ -1381,13 +1383,13 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     wait_for(service, published)
                     if finish == "over_budget":
                         self.assertEqual(cache.evict_host(4), 4)
-                        cache.release_aborted_request(demand)
+                        cache.finish(demand, CacheRequestOutcome.ABORT)
                         continue
                     self.assertEqual(cache.evict_host(4), 0)
                     self.assertEqual(cache.pop_prefetch_loaded_span(demand), (4, 0))
                     self.assertEqual(cache.evict_host(4), 0)
                     if finish == "abort":
-                        cache.release_aborted_request(demand)
+                        cache.finish(demand, CacheRequestOutcome.ABORT)
                     else:
                         cache.finish_storage_prefetch_admission(demand, 4, None)
                     self.assertEqual(cache.evict_host(4), 4)
@@ -1429,11 +1431,11 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     cache.finish_storage_prefetch_admission(first, 4, None)
                     # The second request still needs the same resident pages.
                     self.assertEqual(cache.evict_host(4), 0)
-                    cache.release_aborted_request(second)
+                    cache.finish(second, CacheRequestOutcome.ABORT)
                     self.assertEqual(cache.evict_host(4), 4)
             finally:
-                cache.release_aborted_request(first)
-                cache.release_aborted_request(second)
+                cache.finish(first, CacheRequestOutcome.ABORT)
+                cache.finish(second, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1463,14 +1465,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
 
                     cache.finish_storage_prefetch_admission(first, 4, None)
                     self.assertEqual(cache.evict_host(8), 0)
-                    cache.release_aborted_request(second)
+                    cache.finish(second, CacheRequestOutcome.ABORT)
                     self.assertEqual(cache.evict_host(8), 4)
                     cache.finish_storage_prefetch_admission(independent, 4, None)
                     self.assertEqual(cache.evict_host(8), 4)
                     self.assertEqual(reads.snapshot()["admission_held_tokens"], 0)
             finally:
                 for request in (first, second, independent):
-                    cache.release_aborted_request(request)
+                    cache.finish(request, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1536,7 +1538,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(reads[1:], [demand.rid])
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1586,7 +1588,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(len(reads), 1)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1928,7 +1930,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(len(gets), 2)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -2186,7 +2188,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     service.control.cancel(result.ref)
                     self.assertEqual(wait(service, result).status, Status.CANCELLED)
             finally:
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
                 self._pin_pressure(service, pressure, mode="release")
             assert_retired(cache, service)
             cache.sanity_check()
@@ -2471,6 +2473,54 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
+    def test_request_with_backend_actions_keeps_its_own_storage_read(self):
+        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+
+        hint = KvHintsEnvelope(
+            protocol_version="0.1",
+            message_id="backend-request",
+            actions=[
+                KvHintAction(
+                    action_id="a", action_type="backend.test", action_version="1.0"
+                )
+            ],
+        )
+        with hicache(self, namespace_keys=True) as owner:
+            cache, service, _ = cold_prefix(owner)
+            request = CacheRequestHandle("backend-demand", 0)
+            try:
+                with (
+                    patch.object(
+                        cache.cache_controller.storage_backend,
+                        "consumes_kv_hints",
+                        return_value=True,
+                    ),
+                    patch.object(
+                        service.control.executor.storage_reads,
+                        "join_demand",
+                        return_value=True,
+                    ) as join,
+                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
+                    patch.object(cache, "prefetch_threshold", 1),
+                ):
+                    cache.prefetch_from_storage(
+                        request,
+                        cache.tree_core.root_node.id,
+                        cache_fixtures.array("q", [1, 2, 3, 4]),
+                        matched_prefix_tokens=[],
+                        cache_salt=service.cache_salt(None),
+                        kv_hints=hint,
+                    )
+                    join.assert_not_called()
+                    op = cache.ongoing_prefetch[request].operation
+                    self.assertEqual(op.storage_read_metadata["kv_hints"], hint)
+                    self.assertEqual(
+                        self._consume_ordinary_prefetch(cache, service, request), (4, 0)
+                    )
+            finally:
+                cache.finish(request, CacheRequestOutcome.ABORT)
+            assert_retired(cache, service)
+
     def test_native_demand_coalesces_backend_io(self):
         from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
@@ -2531,7 +2581,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(cache.evict_host(4), 4)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
 
     def test_ordinary_read_survives_original_request_abort_with_a_shared_demand(self):
@@ -2586,12 +2636,12 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         start(second)
                         self.assertNotIn(second, cache.ongoing_prefetch)
                         self.assertIs(reads.demands[second].job.operation, operation)
-                        cache.release_aborted_request(first)
+                        cache.finish(first, CacheRequestOutcome.ABORT)
                         service.progress()
                         self.assertFalse(operation.is_terminated())
 
                         if abort_both:
-                            cache.release_aborted_request(second)
+                            cache.finish(second, CacheRequestOutcome.ABORT)
                             service.progress()
                             self.assertTrue(operation.is_terminated())
                             release.set()
@@ -2603,14 +2653,14 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 (4, 0),
                             )
                             self.assertEqual(cache.evict_host(4), 0)
-                            cache.release_aborted_request(second)
+                            cache.finish(second, CacheRequestOutcome.ABORT)
                             self.assertEqual(cache.evict_host(4), 4)
                         self.assertEqual(calls, ["get"])
                         self.assertEqual(reads.stats["demand_coalesced"], 1)
                 finally:
                     release.set()
-                    cache.release_aborted_request(first)
-                    cache.release_aborted_request(second)
+                    cache.finish(first, CacheRequestOutcome.ABORT)
+                    cache.finish(second, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
                 cache.sanity_check()
 
@@ -2688,7 +2738,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                             self.assertFalse(cancelled.update.quiescent)
                             self.assertFalse(operation.is_terminated())
                         if cancel in ("demand", "both_during_query"):
-                            cache.release_aborted_request(demand)
+                            cache.finish(demand, CacheRequestOutcome.ABORT)
                             service.progress()
                             self.assertEqual(operation.is_terminated(), block_query)
                             self.assertFalse(current(service, hint).update.quiescent)
@@ -2721,7 +2771,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertEqual(reads.stats["jobs_started"], 0)
                 finally:
                     release.set()
-                    cache.release_aborted_request(demand)
+                    cache.finish(demand, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
                 cache.sanity_check()
 
@@ -2794,7 +2844,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         reads = service.control.executor.storage_reads
                         prefix_read = reads.demands[demand].job
                         if hint is None:
-                            cache.release_aborted_request(ancestor_demand)
+                            cache.finish(ancestor_demand, CacheRequestOutcome.ABORT)
                             self.assertFalse(prefix_read.operation.is_terminated())
                         if tail_stored:
                             self._ordinary_prefetch(
@@ -2843,9 +2893,9 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertFalse(prefix_read.host_locks)
                 finally:
                     release.set()
-                    cache.release_aborted_request(ancestor_demand)
-                    cache.release_aborted_request(demand)
-                    cache.release_aborted_request(sibling_demand)
+                    cache.finish(ancestor_demand, CacheRequestOutcome.ABORT)
+                    cache.finish(demand, CacheRequestOutcome.ABORT)
+                    cache.finish(sibling_demand, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
                 cache.sanity_check()
 
@@ -2945,7 +2995,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                                 service.cache_salt(None),
                             )
                         )
-                        cache.release_aborted_request(sibling)
+                        cache.finish(sibling, CacheRequestOutcome.ABORT)
                         self.assertEqual(len(reads.demands), 1)
                         self.assertFalse(
                             next(iter(reads.jobs.values())).operation.is_terminated()
@@ -2955,7 +3005,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         job = next(iter(reads.jobs.values()))
                         self.assertFalse(job.operation.is_terminated())
                         if abort_demand:
-                            cache.release_aborted_request(demand)
+                            cache.finish(demand, CacheRequestOutcome.ABORT)
                             service.progress()
                             self.assertTrue(job.operation.is_terminated())
                         release.set()
@@ -2976,7 +3026,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                         self.assertFalse(service.has_pending)
                 finally:
                     release.set()
-                    cache.release_aborted_request(demand)
+                    cache.finish(demand, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
 
     def test_native_demand_partial_failure_and_abort_leave_no_holds(self):
@@ -3028,7 +3078,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     self.assertEqual(cache.evict_host(4), 2)
             finally:
                 release.set()
-                cache.release_aborted_request(demand)
+                cache.finish(demand, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
 
     def test_native_demand_published_prefix_and_disabled_control(self):

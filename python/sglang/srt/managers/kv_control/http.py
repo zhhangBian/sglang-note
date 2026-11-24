@@ -3,8 +3,6 @@
 
 from fastapi.responses import JSONResponse
 
-from sglang.srt.utils.auth import AuthLevel, auth_level
-
 
 def install_routes(app, get_manager):
     async def send(command):
@@ -28,11 +26,9 @@ def install_routes(app, get_manager):
         return JSONResponse(reply, status_code=status)
 
     @app.get("/v1/kv/capabilities")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def capabilities():
         return await send({"kind": "capabilities"})
 
     @app.post("/v1/kv/control")
-    @auth_level(AuthLevel.ADMIN_OPTIONAL)
     async def control(command: dict):
         return await send(command)

@@ -4,9 +4,13 @@
 pub mod cache;
 pub mod chat;
 pub mod health;
+pub mod kv_control;
 pub mod messages;
 pub mod metrics;
 pub mod models;
+mod reply;
+pub mod responses;
 pub mod tokenize;
-
-pub mod kv_control;
+pub mod unsupported;
+pub mod worker_info;
+pub mod workers;

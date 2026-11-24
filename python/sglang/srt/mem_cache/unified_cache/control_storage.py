@@ -145,6 +145,7 @@ class StorageCacheTransfers:
                 [] if self.cache.hicache_storage_pass_prefix_keys else None,
                 verify_prefix=True,
             )
+            self.cache._backup_requested_tokens[job.operation_id] = len(job.tokens)
             self.cache._native_storage_write_results[job.operation_id] = None
         except Exception as error:
             job.failure = (getattr(error, "code", "storage_error"), str(error)[:512])

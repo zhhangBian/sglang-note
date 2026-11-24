@@ -328,7 +328,10 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
                 return original(*args, **kwargs) if calls == 1 else False
 
             with (
-                patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 2),
+                patch(
+                    "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller.STORAGE_BATCH_SIZE",
+                    2,
+                ),
                 patch.object(cc, "page_set_func", partial),
             ):
                 done = wait(

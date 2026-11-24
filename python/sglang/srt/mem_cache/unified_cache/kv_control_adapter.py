@@ -88,10 +88,14 @@ class UnifiedCacheExecutor:
         self.control_state.bind(engine_id, engine_epoch)
         self.config = self.control_state.config
         self.engine_id, self.engine_epoch = engine_id, engine_epoch
+        windows = cache.window_slots()
+        window_sizes = "+".join(
+            str(cache.components[slot].sliding_window_size) for slot in windows
+        )
         self.layout_id = "python:{}:p{}:w{}".format(
             "+".join(ct.name.lower() for ct in self.core.component_types),
             self.core.page_size,
-            cache._sliding_window_size or 0,
+            window_sizes or "0",
         )
         if cache.tp_world_size > 1:
             self.layout_id += f":tp{cache.tp_world_size}"
@@ -476,8 +480,8 @@ class UnifiedCacheExecutor:
                     missing.append(self._gap(branch, component, end, end, point=True))
                 continue
             size = (
-                self.cache._sliding_window_size
-                if component == ComponentType.SWA
+                self.cache.components[component].sliding_window_size
+                if component in self.cache.window_slots()
                 else None
             )
             if size is not None:
