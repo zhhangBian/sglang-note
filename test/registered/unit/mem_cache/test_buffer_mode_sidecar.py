@@ -50,11 +50,12 @@ register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 _SCHEMA = [str(PoolName.KV)]
 
 
-def _hit_query_controller(*, entry_map=(PoolName.KV,), **fields):
+def _hit_query_controller(*, entry_map=(PoolName.KV,), groups=(), **fields):
     """A controller stand-in that reduces a hit query over the schema of one
     rank whose host pools are ``entry_map``."""
     controller = SimpleNamespace(
-        prefetch_hits_sync_groups=[],
+        prefetch_hits_sync_groups=groups,
+        _all_gather_object=lambda names, group: [names],
         mem_pool_host=SimpleNamespace(entry_map=dict.fromkeys(entry_map)),
         _host_pool_schemas=[],
         **fields,
@@ -79,6 +80,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                 controller = _hit_query_controller(
                     page_size=2,
                     storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
+                    groups=(object(),),
                     _all_reduce=reduce,
                 )
                 operation = PrefetchOperation(
@@ -172,6 +174,7 @@ class TestBufferModeSidecar(unittest.TestCase):
                     controller = _hit_query_controller(
                         storage_backend=backend,
                         page_size=2,
+                        groups=(object(),),
                         _all_reduce=capture,
                     )
                     _, hit_tokens = HybridCacheController._storage_hit_query(

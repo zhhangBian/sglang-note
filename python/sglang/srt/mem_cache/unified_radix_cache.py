@@ -3803,11 +3803,15 @@ class UnifiedRadixCache(BasePrefixCache):
                     yield item
 
         buffer_mode = self.host_memory_mode == "buffer_only"
+        defer_read_staging = (
+            self.host_memory_mode == "cache"
+            and self.tree_core.component_types == (BASE_COMPONENT_TYPE,)
+            and not cc.prefetch_completion_sync_groups
+        )
 
         def _try_alloc_storage_hit(operation) -> bool:
             """Allocate the hit-sized bounce and launch the transfer.
-            Returns False when staging pressure defers the allocation
-            (buffer mode parks and retries; cache mode revokes)."""
+            Return False when staging or I/O pressure defers the allocation."""
             request = operation.handle
             info = self.ongoing_prefetch.get(request)
             hit_tokens = operation.storage_hit_count
@@ -3820,6 +3824,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.revoke_pending_prefetch(request)
                 return True
 
+            operation.host_allocation_deferred = None
+            if defer_read_staging and not cc.prefetch_buffer.empty():
+                operation.host_allocation_deferred = "io"
+                # One ready successor is enough to feed the I/O worker.
+                # Park later hits before they allocate or evict host entries.
+                return False
             if buffer_mode and cc.prefetch_rate_limited():
                 # Pool is load-saturated: hold the KNOWN hit until staged
                 # prefetches ahead of us are consumed. The op stays in
@@ -3923,7 +3933,17 @@ class UnifiedRadixCache(BasePrefixCache):
             return True
 
         def _drain_and_alloc_storage_hit():
-            # Parked hits first, in line order (buffer only).
+            # Retry parked local hits in line order during scheduler drains.
+            local_hits = (
+                [
+                    info.operation
+                    for info in self.ongoing_prefetch.values()
+                    if getattr(info.operation, "host_allocation_deferred", False)
+                ]
+                if defer_read_staging and log_metrics
+                else []
+            )
+            # A parked buffer-mode hit keeps its place at the head of the line.
             if buffer_mode:
                 parked = self.buffer_pipeline.pending_hit_allocs
                 while parked:
@@ -3969,6 +3989,9 @@ class UnifiedRadixCache(BasePrefixCache):
                     self.revoke_pending_prefetch(request)
                     continue
                 self._account_prefetch_outcome(operation, revoked=False)
+                if defer_read_staging:
+                    local_hits.append(operation)
+                    continue
                 # A parked hit keeps its turn: a newer hit must not take the
                 # staging or anchor budget the parked head is waiting for.
                 parked_ahead = buffer_mode and bool(
@@ -3978,6 +4001,18 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Counted once at first parking, not per retry tick.
                     self._prefetch_outcome_stats["declined_rate_limited"] += 1
                     self.buffer_pipeline.pending_hit_allocs.append(operation)
+
+            io_busy = False
+            for operation in local_hits:
+                was_parked = getattr(operation, "host_allocation_deferred", False)
+                if io_busy:
+                    operation.host_allocation_deferred = "io"
+                elif _try_alloc_storage_hit(operation):
+                    continue
+                else:
+                    io_busy = operation.host_allocation_deferred == "io"
+                if not was_parked:
+                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
 
         def _drain_ack_prefetch():
             for ack in _drain_queue(cc.ack_prefetch_queue, n_ack_prefetch):
@@ -4085,11 +4120,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_and_alloc_storage_hit()
+        if not defer_read_staging:
+            _drain_and_alloc_storage_hit()
         _drain_ack_prefetch()
         _drain_backup()
+        if defer_read_staging and n_release is not None:
+            # Terminal ACKs can enqueue unused staging after the queue snapshot.
+            n_release = cc.host_mem_release_queue.qsize()
         _drain_release()
         _drain_extra_release()
+        if defer_read_staging:
+            _drain_and_alloc_storage_hit()
 
     def _all_reduce_storage_drain(self, data: torch.Tensor) -> None:
         """MIN-reduce a per-drain tensor over the ranks whose storage drain

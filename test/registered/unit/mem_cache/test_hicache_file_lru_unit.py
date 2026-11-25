@@ -563,6 +563,25 @@ def _dcp_config(rank=0, tp=4, dcp=2, **overrides):
     return replace(cfg, **overrides)
 
 
+class TestPrefetchBuffer(unittest.TestCase):
+    def test_dequeue_does_not_probe_live_reads_for_cancellation(self):
+        from sglang.srt.managers.cache_controller import (
+            PrefetchOperation,
+            _PrefetchBuffer,
+        )
+
+        queue = _PrefetchBuffer()
+        reads = [PrefetchOperation(str(i), [i]) for i in range(64)]
+        for operation in reads:
+            queue.put(operation)
+        reads[-1].mark_terminate()
+        with mock.patch.object(
+            PrefetchOperation, "is_terminated", side_effect=AssertionError("queue scan")
+        ):
+            self.assertIs(queue.get_nowait(), reads[-1])
+            self.assertEqual([queue.get_nowait() for _ in reads[:-1]], reads[:-1])
+
+
 class TestDcpStorage(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -746,13 +765,19 @@ class TestDcpStorage(unittest.TestCase):
             cc.storage_backend = backend
             cc.page_size = 128
             cc.prefetch_hits_sync_groups = []
-            cc.mem_pool_host = SimpleNamespace(entry_map={})
+            cc.mem_pool_host = SimpleNamespace(
+                entry_map={PoolName.KV: None, PoolName.MAMBA: None}
+            )
+            cc._all_gather_object = lambda names, group: [names, names]
             cc._host_pool_schemas = []
             op = PrefetchOperation(
                 CacheRequestHandle("test", 0), tokens, pool_transfers=[transfer]
             )
             _, hit = cc._storage_hit_query(op)
             self.assertEqual(hit, checkpoints[-1] * 128)
+            with mock.patch.object(cc, "_all_reduce") as local_reduce:
+                self.assertEqual(cc._sync_prefetch_hit_query(op, hit), hit)
+                local_reduce.assert_not_called()
             controllers.append(cc)
             operations.append(op)
 
@@ -771,6 +796,7 @@ class TestDcpStorage(unittest.TestCase):
                 tensor[: peer.numel()] = torch.minimum(tensor[: peer.numel()], peer)
 
             cc._all_reduce = mock.Mock(side_effect=reduce)
+            cc.prefetch_hits_sync_groups = [object()]
             local = operations[rank]
             self.assertEqual(
                 cc._sync_prefetch_hit_query(

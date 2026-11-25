@@ -28,7 +28,6 @@ import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -2229,18 +2228,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         result = DriveHostEvictionResult()
         comp = self.components_by_type.get(component_type)
         if comp is not None:
-            if (
-                not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
-                and self.is_write_back
-                and component_type == BASE_COMPONENT_TYPE
-            ):
-                self._reclaim_full_host_duplicates(
-                    num_tokens,
-                    result.tracker,
-                    result.device_frees,
-                    result.host_frees,
-                    cache_actions=result.cache_actions,
-                )
             comp.drive_host_eviction(
                 num_tokens,
                 result.tracker,

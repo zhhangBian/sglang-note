@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     IncLockRefResult,
@@ -267,28 +268,35 @@ class FullComponent(TreeComponent):
     ) -> None:
         """Evict host leaves to free KV host pool space."""
         self._ensure_eviction_strategy()
-        if tracker[self.component_type] >= num_tokens:
+        tree = self.tree_core
+        ct = self.component_type
+        if (
+            tree.is_write_back
+            and not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+        ):
+            tree._reclaim_full_host_duplicates(
+                num_tokens, tracker, device_frees, host_frees, cache_actions
+            )
+        if tracker[ct] >= num_tokens:
             return
         if self._host_eviction_heap is None:
             self._host_eviction_heap = [
                 (self.session_ref_eviction_strategy(n), n)
-                for n in self.tree_core.evictable_host_leaves
+                for n in tree.evictable_host_leaves
             ]
             heapq.heapify(self._host_eviction_heap)
         heap = self._host_eviction_heap
-        ct = self.component_type
         try:
             while tracker[ct] < num_tokens and heap:
                 _, x = heapq.heappop(heap)
-                if x not in self.tree_core.evictable_host_leaves:
+                if x not in tree.evictable_host_leaves:
                     continue
-                self.tree_core._evict_host_leaf(
+                tree._evict_host_leaf(
                     x, tracker, device_frees, host_frees, cache_actions=cache_actions
                 )
         finally:
             if not (
-                self.is_evict_device_ongoing
-                and not self.tree_core.enable_session_radix_cache
+                self.is_evict_device_ongoing and not tree.enable_session_radix_cache
             ):
                 self._host_eviction_heap = None
 

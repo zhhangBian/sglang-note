@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
@@ -293,7 +294,31 @@ HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 STORAGE_STOP_JOIN_S = 60.0
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchCancellation:
+    """Shared termination state for ordinary and hybrid storage readers."""
+
+    _prefetch_buffer = None
+
+    def __init__(self, *args, **kwargs):
+        self._lock = threading.Lock()
+        self._terminated_flag = False
+        super().__init__(*args, **kwargs)
+
+    def mark_terminate(self):
+        with self._lock:
+            self._terminated_flag = True
+        # The queue checks the flag on insertion. Notify it for cancellation
+        # after insertion, without holding the operation lock across its mutex.
+        buffer = self._prefetch_buffer
+        if buffer is not None:
+            buffer.prioritize_cancelled(self)
+
+    def is_terminated(self) -> bool:
+        with self._lock:
+            return self._terminated_flag
+
+
+class PrefetchOperation(PrefetchCancellation, StorageOperation):
     def __init__(
         self,
         request_id: str,
@@ -303,20 +328,35 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._lock = threading.Lock()
-        self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
-    def mark_terminate(self):
-        with self._lock:
-            self._terminated_flag = True
 
-    def is_terminated(self) -> bool:
-        with self._lock:
-            return self._terminated_flag
+class _PrefetchBuffer(Queue):
+    """Drain cancelled reads before live I/O for a single storage participant."""
+
+    def _init(self, maxsize):
+        self.queue = OrderedDict()
+
+    def _put(self, operation):
+        self.queue[operation] = None
+        if operation is not None:
+            operation._prefetch_buffer = self
+            if operation.is_terminated():
+                self.queue.move_to_end(operation, last=False)
+
+    def prioritize_cancelled(self, operation):
+        with self.mutex:
+            if operation in self.queue:
+                self.queue.move_to_end(operation, last=False)
+
+    def _get(self):
+        operation, _ = self.queue.popitem(last=False)
+        if operation is not None:
+            operation._prefetch_buffer = None
+        return operation
 
 
 def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
@@ -546,7 +586,10 @@ class HiCacheController:
 
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
-        self.prefetch_buffer = Queue()
+        # Collective ACKs require identical operation order across participants.
+        self.prefetch_buffer = (
+            Queue() if self.prefetch_completion_sync_groups else _PrefetchBuffer()
+        )
         self.prefetch_sync_queue = Queue()
         self.prefetch_hit_queue = Queue()
         self.ack_prefetch_queue = Queue()
@@ -1642,6 +1685,8 @@ class HiCacheController:
     def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
         """Rank-reduce a hit query (MIN) so every rank agrees on the usable
         prefix. Runs for every operation, hit or miss."""
+        if not self.prefetch_hits_sync_groups:
+            return storage_hit_count
         hit_count = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce(
             hit_count,
@@ -1759,7 +1804,7 @@ class HiCacheController:
 
     def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
         """Synchronize all ranks to agree on a PrefetchAck."""
-        if ack.completed_tokens is not None:
+        if ack.completed_tokens is not None and self.prefetch_completion_sync_groups:
             # Determine the minimal successful prefix of tokens.
             completed_tokens_tensor = torch.tensor(
                 ack.completed_tokens, dtype=torch.int
