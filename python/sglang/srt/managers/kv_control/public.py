@@ -7,6 +7,7 @@ from sglang.srt.managers.kv_control.contracts import (
     ACTION_VERSION,
     HASH_SCHEME,
     PROTOCOL_VERSION,
+    PUBLIC_ACTIONS,
     ControlError,
     Demote,
     Pin,
@@ -17,8 +18,6 @@ from sglang.srt.managers.kv_control.contracts import (
     TargetOutcome,
     TokensTarget,
 )
-
-PUBLIC_ACTIONS = ("sglang.prefetch", "sglang.demote", "sglang.pin")
 
 
 def public_capabilities(caps):

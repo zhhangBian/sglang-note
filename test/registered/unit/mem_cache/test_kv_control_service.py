@@ -5,8 +5,9 @@ import unittest
 from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 import test_kv_control_cache as cache_fixtures
 
@@ -20,6 +21,7 @@ from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
 from sglang.srt.managers.kv_control.service import (
     KVControlService,
     ServiceConfig,
+    dispatch,
     runtime_config,
 )
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
@@ -67,6 +69,89 @@ insert, match_len, target = (
 
 
 class TestKVControlService(cache_fixtures.KVCacheTestCase):
+    def test_owner_watermark_orders_real_ready_remove_and_scoped_reconciliation(self):
+        import test_kv_control_transfers as transfer_fixtures
+        from sglang.srt.managers.kv_control.contracts import Status
+
+        with transfer_fixtures.hicache(self, storage=True) as owner:
+            _, cache, service, dma = owner
+            self.assertFalse(cache.tree_core.kv_events.enabled)
+            before = service.cache_watermark()
+            node = transfer_fixtures.seed(cache)
+            self.assertGreater(service.cache_watermark().version, before.version)
+            transfer_fixtures.persist_prefix(cache, service, dma, node)
+            self.assertEqual(cache.evict_host(4), 4)
+            result = transfer_fixtures.transfer(service)
+            complete = transfer_fixtures.wait(service, result)
+            node = transfer_fixtures.prefix_path(cache, service)[-1][0]
+            self.assertEqual(complete.status, Status.COMPLETED)
+            ready = complete.cache_watermark
+            self.assertEqual(ready, service.cache_watermark())
+            self.assertEqual(cache.evict_host(100), 4)
+            self.assertIsNone(
+                node.component_data[cache_fixtures.ComponentType.FULL].host_value
+            )
+            self.assertGreater(service.cache_watermark().version, ready.version)
+            scoped = dispatch(
+                service,
+                {
+                    "kind": "residency",
+                    "context": msgspec.to_builtins(service.control.context("A")),
+                    "target": msgspec.json.decode(
+                        msgspec.json.encode(cache_fixtures.target())
+                    ),
+                    "location": {"tier": "host"},
+                },
+            )["data"]
+            self.assertFalse(scoped["items"])
+            self.assertTrue(scoped["missing"])
+            self.assertEqual(scoped["coverage_semantics"], "requested_scope_only")
+            self.assertGreater(scoped["cache_watermark"]["version"], ready.version)
+            # The historical result is unchanged even when its replica is gone.
+            self.assertEqual(service.control.registry.get(result.ref), complete)
+            self.assertEqual(cache.take_events(), [])
+            cache.sanity_check()
+
+    def test_cache_reset_advances_generation_and_fences_old_control_context(self):
+        with service_owner(self) as (cache, service):
+            before = service.cache_watermark()
+            context = service.control.context("router")
+            cache.reset()
+            service.reset_after_cache_flush()
+            current = service.capabilities()["cache_watermark"]
+            self.assertGreater(current.generation, before.generation)
+            self.assertEqual(current.source_epoch, before.source_epoch)
+            reply = dispatch(service, {"kind": "capacity", "context": context})
+            self.assertEqual(reply["error"]["code"], "stale_epoch")
+
+    def test_request_cached_bounds_committed_prefix_to_whole_pages(self):
+        from sglang.srt.managers.kv_control.contracts import MAX_SCOPE_TOKENS
+
+        cache, _ = self.make(session=False, page_size=64)
+        cache.reset()
+        service = KVControlService(
+            cache, ServiceConfig(namespace="ns"), clock=self.clock
+        )
+        for n, expected in ((63, 0), (65, 64), (70000, 65536)):
+            req = serving_request()
+            req.full_untruncated_fill_ids = array("q", range(n))
+            req.finished_reason = FINISH_LENGTH(1)
+            req.kv_control_context = service.control.context(
+                "request", binding_id=str(n)
+            )
+            with patch.object(service.control, "request_event") as finish:
+                service.finish_request(req, committed_len=n, checkpointed=True)
+            committed = finish.call_args.kwargs["committed"]
+            if expected == 0:
+                self.assertIsNone(committed)
+            else:
+                scope = resolve_prefix(
+                    committed, finish.call_args.args[0], service.config.limits
+                )
+                self.assertEqual(scope.requested.end_token, expected)
+                self.assertEqual(scope.content.token_ids, tuple(range(expected)))
+                self.assertLessEqual(expected, MAX_SCOPE_TOKENS)
+
     def test_hicache_runtime_profile_accepts_both_scheduler_modes(self):
         for disabled, tp_size in ((False, 1), (True, 1), (False, 2), (True, 4)):
             with self.subTest(disable_overlap_schedule=disabled, tp_size=tp_size):
@@ -152,6 +237,7 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
             )
             assert isinstance(req, TaggedReq)
             complete_request(cache, service, req)
+            assert service._request_sequence == 0
             assert not hasattr(req, "kv_control_context")
             assert req.cache_salt == encode_cache_salt("ns", salt)
             assert req.kv_control_logical_cache_salt == salt

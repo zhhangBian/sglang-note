@@ -13,6 +13,7 @@ import msgspec
 from sglang.srt.managers.kv_hints import KvHintAction
 
 PROTOCOL_VERSION = "0.1"
+MAX_SCOPE_TOKENS = 65536
 ACTION_VERSION = "1.0"
 MAX_INTEGER = (1 << 53) - 1
 Identifier: TypeAlias = Annotated[str, msgspec.Meta(min_length=1, max_length=256)]
@@ -40,7 +41,7 @@ class Limits(Value):
     max_messages: int = 8192
     retention_seconds: float = 300.0
     max_scope_spans: int = 4096
-    max_scope_tokens: int = 65536
+    max_scope_tokens: int = MAX_SCOPE_TOKENS
     max_page_size: int = 256
 
     def __post_init__(self):
@@ -105,7 +106,7 @@ def cache_compatibility(target) -> CacheCompatibility:
 class TokensTarget(CacheCompatibility, tag="tokens", tag_field="kind", kw_only=True):
     namespace: Identifier
     token_ids: Annotated[
-        tuple[Position, ...], msgspec.Meta(min_length=1, max_length=65536)
+        tuple[Position, ...], msgspec.Meta(min_length=1, max_length=MAX_SCOPE_TOKENS)
     ]
     start_token: Position = 0
     end_token: Position | None = None
@@ -191,7 +192,9 @@ class PrefixTarget(Value, tag="prefix", tag_field="kind"):
     end_token: Position
     # Material always begins at token zero, including all ancestor dependencies.
     token_ids: (
-        Annotated[tuple[TokenId, ...], msgspec.Meta(min_length=1, max_length=65536)]
+        Annotated[
+            tuple[TokenId, ...], msgspec.Meta(min_length=1, max_length=MAX_SCOPE_TOKENS)
+        ]
         | None
     ) = None
     blocks: Annotated[tuple[PrefixBlock, ...], msgspec.Meta(max_length=4096)] = ()
@@ -211,7 +214,7 @@ class PublicLocation(Value):
 PublicTarget: TypeAlias = Target | PrefixTarget
 
 
-class Prefetch(Value):
+class TransferPayload(Value):
     target: PublicTarget
     source: PublicLocation
     destination: PublicLocation
@@ -219,7 +222,11 @@ class Prefetch(Value):
     timeout_ms: Annotated[int, msgspec.Meta(ge=1, le=86400000)] | None = None
 
 
-class Demote(Prefetch):
+class Prefetch(TransferPayload):
+    pass
+
+
+class Demote(TransferPayload):
     pass
 
 
@@ -485,14 +492,24 @@ def validate_public(payload):
             raise ControlError("invalid_payload", "Engine tiers cannot name a backend")
 
 
+_ACTION_SCHEMAS = {
+    "sglang.prefetch": Prefetch,
+    "sglang.demote": Demote,
+    "sglang.pin": Pin,
+}
+PUBLIC_ACTIONS = tuple(_ACTION_SCHEMAS)
+
+
+def is_native_action(action: KvHintAction) -> bool:
+    return (
+        action.action_version == ACTION_VERSION
+        and action.action_type in _ACTION_SCHEMAS
+    )
+
+
 def parse_action(action: KvHintAction) -> Payload:
-    """Interpret only native names; generic forwarding never calls this parser."""
-    schemas = {
-        "sglang.prefetch": Prefetch,
-        "sglang.demote": Demote,
-        "sglang.pin": Pin,
-    }
-    schema = schemas.get(action.action_type)
+    """Interpret a supported action after generic forwarding has selected its owner."""
+    schema = _ACTION_SCHEMAS.get(action.action_type)
     if schema is None or action.action_version != ACTION_VERSION:
         raise ControlError("unsupported", "Unsupported native action or action version")
     payload = validated(action.payload, schema)

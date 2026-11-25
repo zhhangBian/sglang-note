@@ -137,10 +137,12 @@ class TestKVControl(CustomTestCase):
         )
         unknown = action("future_action", {}, action_id="unsupported")
         legacy = action("copy_to", movement(), action_id="legacy")
-        original = envelope(opaque, invalid, unknown, legacy, action())
+        future_version = action("pin", {}, action_id="new-version", version="2.0")
+        original = envelope(opaque, invalid, unknown, legacy, future_version, action())
         result = core.submit(original, core.context("router"))
         assert [r.status for r in result.results] == [
             Status.REJECTED,
+            Status.UNSUPPORTED,
             Status.UNSUPPORTED,
             Status.UNSUPPORTED,
             Status.RUNNING,
@@ -486,7 +488,9 @@ class TestPublicKVProtocol(CustomTestCase):
             with self.subTest(case=case["name"]):
                 a = msgspec.convert(value, type=KvHintAction)
                 if case["valid"]:
-                    parse_action(a)
+                    payload = parse_action(a)
+                    if isinstance(payload, Demote):
+                        self.assertNotIsInstance(payload, Prefetch)
                 else:
                     with self.assertRaises(ControlError):
                         parse_action(a)
@@ -656,18 +660,18 @@ class TestPublicKVProtocol(CustomTestCase):
         control.request_event(context, "success", committed=tokens())
         self.assertEqual(executor.starts, 0)
 
-    def test_engine_rejects_session_selectors_and_legacy_actions(self):
+    def test_engine_rejects_session_selectors_and_reports_legacy_actions(self):
         control, executor, _ = self.owner()
         payload = movement()
         payload["target"] = {"kind": "session", "namespace": "ns", "session_id": "live"}
         result = submit(control, action("prefetch", payload)).results[0]
         self.assertEqual(result.status, Status.REJECTED)
         self.assertEqual(result.update.code, "invalid_payload")
-        legacy = submit(
-            control, action("copy_to", movement()), message_id="legacy"
-        ).results[0]
-        self.assertEqual(legacy.status, Status.UNSUPPORTED)
-        self.assertNotIn("public_result", wire(legacy))
+        legacy = action("copy_to", movement())
+        submission = submit(control, legacy, message_id="legacy")
+        self.assertEqual(submission.results[0].status, Status.UNSUPPORTED)
+        self.assertNotIn("public_result", wire(submission.results[0]))
+        self.assertFalse(submission.unhandled_actions)
         self.assertEqual(executor.starts, 0)
 
     def test_missing_and_capacity_results_keep_scope_and_reason(self):

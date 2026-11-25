@@ -126,8 +126,6 @@ class HostCacheProtection:
             },
         )
         executor.control_state.host_priorities = self.registry.priorities
-        self._scopes: dict[ProtectionKey, tuple[TargetOutcome, ...]] = {}
-        self._owners: dict[ProtectionKey, TaskIdentity | None] = {}
         self._events: deque[ClaimEvent] = deque(maxlen=limits.max_events)
         self._sequence = 0
         self._root = executor.core.root_node
@@ -149,7 +147,7 @@ class HostCacheProtection:
                 snapshot = self.registry.get(snapshot.key)
                 remaining = None
         active = snapshot.state == "active"
-        owner = self._owners.get(snapshot.key)
+        owner = snapshot.owner_task
         return ClaimState(
             caller_id=snapshot.key.caller_id,
             task_incarnation=str(owner.incarnation) if owner else "caller",
@@ -168,7 +166,7 @@ class HostCacheProtection:
             remaining_ttl=remaining,
             priority=snapshot.priority,
             owner_task=owner,
-            actual_scope=self._scopes.get(snapshot.key, ()),
+            actual_scope=snapshot.actual_scope,
             location=PublicLocation(tier="host", engine_id=self.executor.engine_id),
         )
 
@@ -273,13 +271,13 @@ class HostCacheProtection:
                     key=key,
                     revision=payload.revision,
                     prefixes=self._prefixes(scope),
+                    owner_task=payload.owner_task,
+                    actual_scope=self.outcomes(
+                        scope, status=Status.COMPLETED, step="protection_active"
+                    ),
                     ttl_seconds=payload.ttl_seconds,
                     priority=payload.priority,
                 )
-                if snapshot.state == "active":
-                    self._scopes[key] = self.outcomes(
-                        scope, status=Status.COMPLETED, step="protection_active"
-                    )
             elif payload.mode == "renew":
                 snapshot = self.registry.renew(
                     key=key,
@@ -288,15 +286,16 @@ class HostCacheProtection:
                     priority=payload.priority,
                 )
             else:
-                snapshot = self.registry.release(key=key, revision=payload.revision)
-            self._owners[key] = payload.owner_task
+                snapshot = self.registry.release(
+                    key=key, revision=payload.revision, owner_task=payload.owner_task
+                )
             state = (
                 self._publish(snapshot)
                 if previous != snapshot
                 else self.state(snapshot)
             )
             outcomes = (
-                self._scopes.get(key, ())
+                snapshot.actual_scope
                 if payload.mode == "acquire" and snapshot.state == "active"
                 else ()
             )

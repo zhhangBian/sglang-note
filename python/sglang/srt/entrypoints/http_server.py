@@ -181,6 +181,7 @@ from sglang.srt.managers.io_struct import (
     VertexGenerateReqInput,
 )
 from sglang.srt.managers.kv_control.http import (
+    authorize_attached_actions,
     install_routes as install_kv_control_routes,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
@@ -993,6 +994,7 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     """Serve an admitted generate request: `generate_request` after its
     contract check. A route that admits requests with its own parser calls
     this directly, so the body is not decoded and checked a second time."""
+    authorize_attached_actions(obj.kv_hints, request)
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
@@ -1897,6 +1899,7 @@ async def continue_generation(
 @app.post("/v1/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_completions(request: CompletionRequest, raw_request: Request):
     """OpenAI-compatible text completion endpoint."""
+    authorize_attached_actions(request.kv_hints, raw_request)
     return model_json_response(
         await raw_request.app.state.openai_serving_completion.handle_request(
             request, raw_request
@@ -1909,6 +1912,7 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    authorize_attached_actions(request.kv_hints, raw_request)
     return model_json_response(
         await raw_request.app.state.openai_serving_chat.handle_request(
             request, raw_request

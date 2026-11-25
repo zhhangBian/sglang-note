@@ -15,6 +15,7 @@ from dataclasses import dataclass
 import msgspec
 from sglang.srt.managers.kv_control.contracts import (
     MAX_INTEGER,
+    PUBLIC_ACTIONS,
     Acknowledgement,
     ControlContext,
     ControlError,
@@ -28,9 +29,10 @@ from sglang.srt.managers.kv_control.contracts import (
     Status,
     Submission,
     Value,
+    is_native_action,
     validated,
 )
-from sglang.srt.managers.kv_control.public import PUBLIC_ACTIONS, project_result
+from sglang.srt.managers.kv_control.public import project_result
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 
 
@@ -58,7 +60,7 @@ class NativeBatch(Value):
 
 
 def snapshot_envelope(
-    envelope: KvHintsEnvelope, limits: Limits
+    envelope: KvHintsEnvelope, limits: Limits, *, request_attached: bool
 ) -> tuple[NativeBatch, tuple[KvHintAction, ...]]:
     """Snapshot native JSON without inspecting independent consumers' payloads.
 
@@ -72,9 +74,14 @@ def snapshot_envelope(
     for action in envelope.actions:
         if not isinstance(action, KvHintAction) or type(action.action_type) is not str:
             raise ControlError("invalid_envelope", "Malformed action wrapper")
-        (native if action.action_type.startswith("sglang.") else unhandled).append(
-            action
+        # On inference requests other consumers can own future names or versions.
+        # Standalone control returns an operation receipt for every sglang.* action.
+        claimed = (
+            is_native_action(action)
+            if request_attached
+            else action.action_type.startswith("sglang.")
         )
+        (native if claimed else unhandled).append(action)
     if len(native) > limits.max_actions:
         raise ControlError("capacity", "Native action count exceeds limit")
     if not native:
@@ -199,7 +206,6 @@ class OperationRegistry:
         self._active = 0
         self._sequence = 0
         self._issued = 0
-        self.on_result = None
         self.cache_watermark = None
 
     def _stamp(self, result):
@@ -207,8 +213,6 @@ class OperationRegistry:
             result = msgspec.structs.replace(
                 result, cache_watermark=self.cache_watermark()
             )
-        if self.on_result is not None:
-            self.on_result(result)
         return result
 
     def validate_context(self, context: ControlContext) -> ControlContext:

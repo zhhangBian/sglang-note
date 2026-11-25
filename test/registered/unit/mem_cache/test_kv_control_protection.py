@@ -103,6 +103,57 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(pins.active_claims, 0)
             cache.sanity_check()
 
+    def test_tp_reservation_failure_rolls_back_successful_peer(self):
+        with transfer_fixtures.hicache(self) as owner:
+            _, cache, service, _ = owner
+            node = host_copy(owner)
+            pins = registry(owner, prepare_shards=service.prepare_shards)
+            # Exercise both local views of the same two-rank collective.
+            for failing_rank in (False, True):
+                votes = []
+
+                def gather(verdicts, error, *, group):
+                    votes.append(error)
+                    if len(votes) == 1:
+                        self.assertIsNone(error)
+                        return
+                    self.assertEqual(
+                        node.component_data[FULL].host_lock_ref, int(not failing_rank)
+                    )
+                    if failing_rank:
+                        self.assertEqual(
+                            error, ("shard_admission_failed", "reservation failed")
+                        )
+                    verdicts[:] = [
+                        None,
+                        ("shard_admission_failed", "reservation failed"),
+                    ]
+
+                with (
+                    patch.object(service, "tp_group", object()),
+                    patch.object(service, "tp_size", 2),
+                    patch("torch.distributed.all_gather_object", side_effect=gather),
+                    patch.object(
+                        cache, "inc_host_lock_ref", wraps=cache.inc_host_lock_ref
+                    ) as hold,
+                ):
+                    if failing_rank:
+                        hold.side_effect = RuntimeError("reservation failed")
+                    self.error(
+                        "shard_admission_failed",
+                        pins.acquire,
+                        key=claim(),
+                        revision=1,
+                        prefixes=prefixes((1, 2, 3, 4)),
+                        ttl_seconds=10,
+                    )
+                self.assertEqual(len(votes), 2)
+                self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
+                self.assertEqual(pins.protected_tokens, 0)
+                self.assertEqual(pins.active_claims, 0)
+                self.assertIsNone(pins.get(claim()))
+            cache.sanity_check()
+
     def test_native_host_pressure_preserves_bytes_until_independent_claim_release(self):
         with transfer_fixtures.hicache(self) as owner:
             _, cache, _, _ = owner
@@ -274,7 +325,9 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             owner[1].sanity_check()
 
-    def test_capacity_rejects_before_holds_and_keeps_terminal_revision_records(self):
+    def test_active_claim_cap_and_per_claim_revisions_across_retired_fifo_rollover(
+        self,
+    ):
         with transfer_fixtures.hicache(self) as owner:
             held = host_copy(owner)
             extra = host_copy(owner, (8, 9))
@@ -313,15 +366,27 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             pins.release(key=claim(), revision=2)
             pins.release(key=claim("B"), revision=2)
             pins.release(key=claim("C"), revision=1)
+            self.error("released", pins.renew, key=claim(), revision=3, ttl_seconds=10)
+            for i in range(3 * pins.max_records + 1):
+                key = claim(name=f"pin-{i}")
+                active = pins.acquire(
+                    key=key, revision=1, prefixes=scope, ttl_seconds=10
+                )
+                self.assertEqual(active.state, "active")
+                ended = pins.release(key=key, revision=2)
+                self.assertEqual(ended.state, "released")
+                self.assertEqual(ended.prefixes, ())
+                self.assertEqual(len(pins._retired), pins.max_records)
+            self.assertIsNone(pins.get(claim(name="pin-0")))
             self.error(
-                "capacity",
+                "stale_revision",
                 pins.acquire,
-                key=claim("D"),
+                key=key,
                 revision=1,
                 prefixes=scope,
                 ttl_seconds=10,
             )
-            self.error("released", pins.renew, key=claim(), revision=3, ttl_seconds=10)
+            self.assertEqual(pins.release(key=key, revision=2), ended)
             self.assertEqual(pins.protected_tokens, 0)
             self.assertEqual(held.component_data[FULL].host_lock_ref, 0)
             owner[1].sanity_check()
@@ -673,6 +738,32 @@ def pin_hints(service, **kwargs):
 
 
 class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
+    def test_attachment_passes_through_unowned_actions_without_allocating_context(self):
+        with transfer_fixtures.hicache(self) as owner:
+            _, _, service, _ = owner
+            hints = pin_hints(service)
+            pin = hints.actions[0]
+            external = msgspec.structs.replace(
+                pin, action_type="sglang.backend_specific"
+            )
+            newer = msgspec.structs.replace(pin, action_version="2.0")
+            req = service_fixtures.serving_request()
+            req.kv_hints = msgspec.structs.replace(hints, actions=[external, newer])
+            service.prepare_request(req)
+            service.attach(req, req.kv_hints)
+            self.assertFalse(hasattr(req, "kv_control_context"))
+            self.assertEqual(service._request_sequence, 0)
+            self.assertEqual(req.kv_hints.actions, [external, newer])
+            req.kv_hints = msgspec.structs.replace(
+                hints, actions=[external, pin, newer]
+            )
+            service.attach(req, req.kv_hints)
+            self.assertEqual(req.kv_hints.actions, [external, newer])
+            receipt = service.control.registry.query(
+                req.kv_control_context, hints.message_id
+            )
+            self.assertEqual([r.action_type for r in receipt.results], ["sglang.pin"])
+
     def test_attached_explicit_prefix_receipt_survives_abort_and_supports_unbound_followup(
         self,
     ):
@@ -1002,6 +1093,11 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                     reply = (await client.post("/v1/kv/control", json=request)).json()[
                         "data"
                     ]
+                    mark = msgspec.to_builtins(service.cache_watermark())
+                    self.assertEqual(reply["cache_watermark"], mark)
+                    discovery = (await client.get("/v1/kv/capabilities")).json()["data"]
+                    self.assertNotIn("feedback", discovery)
+                    self.assertEqual(discovery["cache_watermark"], mark)
                     result = reply["results"][0]
                     self.assertEqual(result["update"]["status"], "completed")
                     self.assertEqual(
@@ -1024,7 +1120,31 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                     state = (await client.post("/v1/kv/control", json=query)).json()[
                         "data"
                     ]
+                    self.assertEqual(state["cache_watermark"], mark)
                     self.assertEqual(state["remaining_ttl"], 7)
+                    self.assertEqual(state["ttl_remaining_ms"], 7000)
+                    self.assertTrue(state["active"])
+                    message = {
+                        "kind": "query",
+                        "context": request["context"],
+                        "message_id": "pin",
+                    }
+                    for claim_id in ("pin", "absent"):
+                        combined = (
+                            await client.post(
+                                "/v1/kv/control",
+                                json={**message, "include_claim_id": claim_id},
+                            )
+                        ).json()["data"]
+                        self.assertEqual(combined["cache_watermark"], mark)
+                        self.assertEqual(combined["results"], reply["results"])
+                        self.assertEqual(
+                            combined["claim"], state if claim_id == "pin" else None
+                        )
+                    missing = await client.post(
+                        "/v1/kv/control", json={**query, "claim_id": "absent"}
+                    )
+                    self.assertEqual(missing.status_code, 404)
                     self.assertEqual(
                         state["effective_protection"], "eviction_exclusion"
                     )
@@ -1361,8 +1481,9 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             self.assertIsNone(denied["public_result"]["claim"])
             legacy = pin_command(service, message="legacy")
             legacy["envelope"]["actions"][0]["action_type"] = "sglang.set_priority"
-            denied = dispatch(service, legacy)["data"]["results"][0]
-            self.assertEqual(denied["update"]["status"], "unsupported")
+            reply = dispatch(service, legacy)["data"]
+            self.assertEqual(reply["results"][0]["update"]["status"], "unsupported")
+            self.assertFalse(reply["unhandled_actions"])
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 

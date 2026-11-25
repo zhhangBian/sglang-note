@@ -20,11 +20,11 @@ from sglang.srt.managers.kv_control.contracts import (
     OperationRef,
     OperationResult,
     Pin,
-    Prefetch,
     ResolvedTarget,
     Status,
     Submission,
     TokensTarget,
+    TransferPayload,
     Value,
     parse_action,
     resolve_prefix,
@@ -40,7 +40,7 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope
 
 class ExecutionRequest(Value):
     ref: OperationRef
-    payload: Prefetch
+    payload: TransferPayload
     target: ResolvedTarget
     max_result_targets: int = 4096
 
@@ -72,7 +72,7 @@ class Executor(Protocol):
 @dataclass
 class _Pending:
     ref: OperationRef
-    payload: Prefetch | Pin
+    payload: TransferPayload | Pin
     target: ResolvedTarget | None
     started: bool = False
     cancel_sent: bool = False
@@ -131,7 +131,9 @@ class KVControl:
     ) -> Submission:
         if type(execute_primitives) is not bool:
             raise ControlError("invalid_payload", "Execution support must be a bool")
-        batch, unhandled = snapshot_envelope(envelope, self.limits)
+        batch, unhandled = snapshot_envelope(
+            envelope, self.limits, request_attached=context.binding_id is not None
+        )
         if not batch.actions:
             return Submission(replayed=False, unhandled_actions=unhandled)
         submission = self.registry.reserve(batch, context)
@@ -187,7 +189,7 @@ class KVControl:
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
-                if isinstance(payload, Prefetch) or (
+                if isinstance(payload, TransferPayload) or (
                     isinstance(payload, Pin)
                     and payload.mode == "acquire"
                     and payload.target == "request_cached"
@@ -197,7 +199,7 @@ class KVControl:
                         payload,
                         scope,
                         deadline=self._clock() + payload.timeout_ms / 1000
-                        if isinstance(payload, Prefetch)
+                        if isinstance(payload, TransferPayload)
                         and payload.timeout_ms is not None
                         else None,
                     )

@@ -1,4 +1,4 @@
-# Programmable KV cache
+# Session-aware KV cache control
 
 Native KV control is disabled by default. It lets a caller use three versioned
 actions:
@@ -67,10 +67,19 @@ Use the Engine ID, epoch and namespace returned by discovery in every command:
 }
 ```
 
+HTTP inference requests carrying version 1.0 PIN, PREFETCH, or DEMOTE actions
+require the configured admin credential. Use the admin bearer in `Authorization`
+on an admin-key-only server. When inference also requires a separate user key,
+send the user bearer in `Authorization` and the admin bearer in
+`X-SGLang-Admin-Authorization`. Other action names and versions pass through to
+their backend consumers. Standalone control submissions return an `unsupported`
+result for each unrecognized `sglang.*` name or version.
+
 Use a target that matches the worker's page size, layout and cache salt. A PIN
 requires an already published host copy; it does not copy missing data. An
 attached PIN targeting `"request_cached"` binds only after successful request
-completion and cache checkpointing.
+completion and cache checkpointing. Its scope ends at the last full page within
+the committed prefix and the configured token budget (at most 65,536 tokens).
 
 Acquiring or renewing a PIN requires `ttl_seconds`, `priority`, or both.
 TTL starts on the Engine after it holds the host pages. The optional signed
@@ -81,7 +90,14 @@ and keeps any assigned priority. Renewal updates only supplied fields;
 release supplies neither. Eviction invalidates the claim before slots can be
 reused. The claim view reports its own priority and any remaining hard TTL.
 
-Use `query` and `claim` to inspect the result. `cancel` drains worker access before
+Revisions increase within each claim. A new claim ID can start at revision 1
+even after the retired history fills. The Engine checks replays against active
+claims and the most recent `max_records` retired claims. Once a terminal record
+leaves that FIFO, the Engine treats its claim ID as unseen.
+
+Capabilities, submission, query, claim, and residency replies carry the current
+cache watermark. Pass `include_claim_id` with a message query to read its live
+claim state in the same reply. `cancel` drains worker access before
 releasing resources. Acknowledge with `ack` once the operation is quiescent. An
 identical message can be replayed within the retention window; a changed payload
 with the same identity is rejected. Capacity refusal preserves the inference

@@ -3,17 +3,26 @@
 
 from __future__ import annotations
 
+import hashlib
+import heapq
 import math
 import threading
 import time
 from array import array
+from collections import OrderedDict
 from collections.abc import Callable
 from itertools import islice
 from typing import TYPE_CHECKING, Literal
 
 import msgspec
 
-from sglang.srt.managers.kv_control.contracts import ControlError, Priority, validated
+from sglang.srt.managers.kv_control.contracts import (
+    ControlError,
+    Priority,
+    TargetOutcome,
+    TaskIdentity,
+    validated,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 if TYPE_CHECKING:
@@ -36,7 +45,7 @@ def _revision(value: int) -> None:
         raise ControlError("invalid", "Revision/incarnation must be a bounded integer")
 
 
-class ProtectionKey(msgspec.Struct, frozen=True, kw_only=True):
+class ProtectionKey(msgspec.Struct, frozen=True, kw_only=True, order=True):
     caller_id: str
     task_id: str
     task_incarnation: int
@@ -74,6 +83,8 @@ class ProtectionSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     namespace: str
     priority: int | None = None
     reason: str = ""
+    owner_task: TaskIdentity | None = None
+    actual_scope: tuple[TargetOutcome, ...] = ()
 
 
 class _Record(msgspec.Struct, kw_only=True):
@@ -91,12 +102,8 @@ class ProtectionRegistry:
     operation completing has no effect on these independently owned locks.
 
     Active claims and terminal revision records have separate finite bounds.
-    Terminal records are never evicted: exhaustion rejects new claim keys.
-    Released/expired keys cannot be renewed or reacquired; use a new claim ID.
-    Retiring this registry and advancing the control epoch is the reclamation
-    boundary. ``invalidate`` closes it, and cache reset also closes it lazily
-    on the next owner access. The service must publish the returned changes and
-    call ``expire`` while idle; it must invalidate before an explicit flush.
+    Each key has its own revision history. The FIFO keeps compact terminal
+    records for replay until newer retirements displace them.
     """
 
     def __init__(
@@ -132,8 +139,6 @@ class ProtectionRegistry:
                 raise ControlError(
                     "invalid", "Protection budgets must be bounded positive integers"
                 )
-        if max_claims > max_records:
-            raise ControlError("invalid", "Claim budget exceeds revision record budget")
         if (
             type(max_ttl_seconds) not in (int, float)
             or not math.isfinite(max_ttl_seconds)
@@ -174,7 +179,8 @@ class ProtectionRegistry:
         self._priority_refs: dict[int, dict[ProtectionKey, int]] = {}
         self.priorities: dict[int, int] = {}
         self._pending_changes: dict[ProtectionKey, ProtectionSnapshot] = {}
-        self._active_count = 0
+        self._retired: OrderedDict[ProtectionKey, _Record] = OrderedDict()
+        self._deadlines: list[tuple[float, ProtectionKey, int]] = []
         self._invalidated = ""
 
     def _supported(self) -> None:
@@ -246,7 +252,7 @@ class ProtectionRegistry:
     def _record(self, key: ProtectionKey, now: float) -> _Record | None:
         if not isinstance(key, ProtectionKey):
             raise ControlError("invalid", "Protection requires a typed claim key")
-        record = self._records.get(key)
+        record = self._records.get(key) or self._retired.get(key)
         if record is not None and self._expire(record, now):
             self._pending_changes[key] = record.snapshot
         return record
@@ -385,16 +391,25 @@ class ProtectionRegistry:
         ):
             raise ControlError("capacity", "L2 protection token capacity exhausted")
 
-    def _hold_ttl(self, spans, pages, ttl):
-        holds = self._hold(self._materialize(spans))
+    def _reserve(self, spans, pages, ttl, now):
+        holds = ()
+
+        def reserve():
+            nonlocal holds, now
+            nodes = self._materialize(spans)
+            if nodes and ttl is not None:
+                holds = self._hold(nodes)
+                now = self._now()
+                self._ttl(ttl, now)
+
         try:
-            now = self._now()
-            self._ttl(ttl, now)
+            self._prepare_shards(reserve)
         except Exception:
             self._release(holds)
             raise
-        for page in pages:
-            self._physical_refs[page] = self._physical_refs.get(page, 0) + 1
+        if holds:
+            for page in pages:
+                self._physical_refs[page] = self._physical_refs.get(page, 0) + 1
         return holds, now
 
     def _set_priority(self, record: _Record, priority: int | None):
@@ -418,6 +433,8 @@ class ProtectionRegistry:
         key: ProtectionKey,
         revision: int,
         prefixes: tuple[HostPrefix, ...],
+        owner_task: TaskIdentity | None = None,
+        actual_scope: tuple[TargetOutcome, ...] = (),
         ttl_seconds: float | None = None,
         priority: int | None = None,
     ) -> ProtectionSnapshot:
@@ -428,7 +445,12 @@ class ProtectionRegistry:
             now = self._now()
             ttl, effective_priority = self._parameters(ttl_seconds, priority, now)
             record = self._record(key, now)
-            fingerprint = ("acquire", prefixes, ttl, effective_priority)
+            fingerprint = (
+                "acquire",
+                hashlib.sha256(msgspec.json.encode(prefixes)).digest(),
+                ttl,
+                effective_priority,
+            )
             replay = self._replay(record, revision, fingerprint)
             if replay is not None:
                 return replay, None
@@ -448,13 +470,11 @@ class ProtectionRegistry:
 
         replay, prepared = self._prepare_shards(prepare)
         if replay is not None:
+            # Other ranks still participate in the reservation vote.
+            self._prepare_shards(lambda: None)
             return replay
         now, ttl, priority, record, fingerprint, spans, pages = prepared
-        holds = ()
-        if ttl is not None:
-            holds, now = self._hold_ttl(spans, pages, ttl)
-        else:
-            self._materialize(spans)
+        holds, now = self._reserve(spans, pages, ttl, now)
         # Acquire the replacement first: an update never opens an eviction gap.
         if record is not None:
             self._drop_holds(record)
@@ -463,6 +483,8 @@ class ProtectionRegistry:
             key=key,
             revision=revision,
             state="active",
+            owner_task=owner_task,
+            actual_scope=actual_scope,
             prefixes=prefixes,
             physical_tokens=len(pages) * self._core.page_size,
             activated_at=now,
@@ -477,8 +499,7 @@ class ProtectionRegistry:
         )
         self._set_priority(replacement, priority)
         self._records[key] = replacement
-        if record is None:
-            self._active_count += 1
+        self._schedule(snapshot)
         return snapshot
 
     def _admit_key(self, record: _Record | None) -> None:
@@ -492,13 +513,8 @@ class ProtectionRegistry:
                 record.snapshot.state,
                 "A terminal protection key requires a new claim ID",
             )
-        if record is None and (
-            len(self._records) >= self.max_records
-            or self._active_count >= self.max_claims
-        ):
-            raise ControlError(
-                "capacity", "L2 protection claim/revision capacity exhausted"
-            )
+        if record is None and len(self._records) >= self.max_claims:
+            raise ControlError("capacity", "L2 active claim capacity exhausted")
 
     def renew(
         self,
@@ -541,10 +557,13 @@ class ProtectionRegistry:
 
         replay, prepared = self._prepare_shards(prepare)
         if replay is not None:
+            # Other ranks still participate in the reservation vote.
+            self._prepare_shards(lambda: None)
             return replay
         now, ttl, priority, record, fingerprint, spans, pages = prepared
-        if spans:
-            record.holds, now = self._hold_ttl(spans, pages, ttl)
+        holds, now = self._reserve(spans, pages, ttl, now)
+        if holds:
+            record.holds = holds
         if priority is not None:
             self._set_priority(record, priority)
         record.snapshot = msgspec.structs.replace(
@@ -554,9 +573,16 @@ class ProtectionRegistry:
             priority=priority if priority is not None else record.snapshot.priority,
         )
         record.fingerprint = fingerprint
+        self._schedule(record.snapshot)
         return record.snapshot
 
-    def release(self, *, key: ProtectionKey, revision: int) -> ProtectionSnapshot:
+    def release(
+        self,
+        *,
+        key: ProtectionKey,
+        revision: int,
+        owner_task: TaskIdentity | None = None,
+    ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
         now = self._now()
@@ -566,13 +592,12 @@ class ProtectionRegistry:
         if replay is not None:
             return replay
         if record is None:
-            if len(self._records) >= self.max_records:
-                raise ControlError("capacity", "Protection revision capacity exhausted")
             record = _Record(
                 snapshot=ProtectionSnapshot(
                     key=key,
                     revision=revision,
                     state="released",
+                    owner_task=owner_task,
                     prefixes=(),
                     physical_tokens=0,
                     activated_at=None,
@@ -583,7 +608,7 @@ class ProtectionRegistry:
                 ),
                 fingerprint=fingerprint,
             )
-            self._records[key] = record
+            self._remember_retired(record)
         else:
             self._retire(record, state="released", reason="explicit_release")
             record.snapshot = msgspec.structs.replace(
@@ -617,10 +642,53 @@ class ProtectionRegistry:
             self._drop_holds(record, release_holds=release_holds)
             self._set_priority(record, None)
             record.pages = frozenset()
-            self._active_count -= 1
+            del self._records[record.snapshot.key]
+            self._pending_changes.pop(record.snapshot.key, None)
             record.snapshot = msgspec.structs.replace(
-                record.snapshot, state=state, reason=reason, priority=None
+                record.snapshot,
+                state=state,
+                reason=reason,
+                priority=None,
+                prefixes=(),
+                physical_tokens=0,
+                expires_at=None,
             )
+
+            self._remember_retired(record)
+
+    def _remember_retired(self, record):
+        self._retired[record.snapshot.key] = record
+        if len(self._retired) > self.max_records:
+            key, _ = self._retired.popitem(last=False)
+            self._pending_changes.pop(key, None)
+
+    def _schedule(self, snapshot):
+        if snapshot.expires_at is None:
+            return
+        heapq.heappush(
+            self._deadlines, (snapshot.expires_at, snapshot.key, snapshot.revision)
+        )
+        # Bound stale entries when a caller repeatedly renews a long-lived PIN.
+        if len(self._deadlines) > 2 * self.max_claims:
+            self._deadlines = [
+                (s.expires_at, s.key, s.revision)
+                for record in self._records.values()
+                if (s := record.snapshot).expires_at is not None
+            ]
+            heapq.heapify(self._deadlines)
+
+    def _first_deadline(self):
+        while self._deadlines:
+            deadline, key, revision = self._deadlines[0]
+            record = self._records.get(key)
+            if (
+                record is not None
+                and record.snapshot.revision == revision
+                and record.snapshot.expires_at == deadline
+            ):
+                return deadline
+            heapq.heappop(self._deadlines)
+        return None
 
     def _expire(self, record: _Record, now: float) -> bool:
         snapshot = record.snapshot
@@ -641,7 +709,7 @@ class ProtectionRegistry:
         self._check()
         keys = {key for page in pages for key in self._priority_refs.get(page, ())}
         changes = []
-        for key in keys:
+        for key in sorted(keys):
             record = self._records[key]
             assert not record.holds, "Capacity eviction must respect L2 host holds"
             self._retire(record, state="invalidated", reason="host_evicted")
@@ -668,15 +736,17 @@ class ProtectionRegistry:
         expired = []
         for key in tuple(islice(self._pending_changes, limit)):
             snapshot = self._pending_changes.pop(key)
-            if self._records[key].snapshot == snapshot:
+            record = self._records.get(key) or self._retired.get(key)
+            if record is not None and record.snapshot == snapshot:
                 expired.append(snapshot)
-        if len(expired) == limit:
-            return tuple(expired)
-        for record in self._records.values():
-            if self._expire(record, now):
-                expired.append(record.snapshot)
-                if len(expired) == limit:
-                    break
+        while len(expired) < limit:
+            deadline = self._first_deadline()
+            if deadline is None or deadline > now:
+                break
+            _, key, _ = heapq.heappop(self._deadlines)
+            record = self._records[key]
+            self._expire(record, now)
+            expired.append(record.snapshot)
         return tuple(expired)
 
     def cleanup_task(
@@ -687,12 +757,12 @@ class ProtectionRegistry:
         _identifier(task_id, "task_id")
         _revision(task_incarnation)
         retired = []
-        for key, record in self._records.items():
+        for key, record in list(self._records.items()):
             if (key.caller_id, key.task_id, key.task_incarnation) == (
                 caller_id,
                 task_id,
                 task_incarnation,
-            ) and record.snapshot.state == "active":
+            ):
                 self._retire(record, state="released", reason="task_finished")
                 retired.append(record.snapshot)
         return tuple(retired)
@@ -701,15 +771,11 @@ class ProtectionRegistry:
         self, reason: str, *, release_holds: bool
     ) -> tuple[ProtectionSnapshot, ...]:
         changes = []
-        for record in self._records.values():
-            if record.snapshot.state == "active":
-                self._retire(
-                    record,
-                    state="invalidated",
-                    reason=reason,
-                    release_holds=release_holds,
-                )
-                changes.append(record.snapshot)
+        for record in list(self._records.values()):
+            self._retire(
+                record, state="invalidated", reason=reason, release_holds=release_holds
+            )
+            changes.append(record.snapshot)
         self._invalidated = reason
         self._root = None
         return tuple(changes)
@@ -722,7 +788,8 @@ class ProtectionRegistry:
         pending = tuple(
             s
             for key, s in self._pending_changes.items()
-            if self._records[key].snapshot == s
+            if (record := self._records.get(key) or self._retired.get(key)) is not None
+            and record.snapshot == s
         )
         self._pending_changes.clear()
         return pending + self._invalidate(reason, release_holds=not self._invalidated)
@@ -732,14 +799,7 @@ class ProtectionRegistry:
         self._check()
         if self._pending_changes:
             return self._now()
-        return min(
-            (
-                r.snapshot.expires_at
-                for r in self._records.values()
-                if r.snapshot.state == "active" and r.snapshot.expires_at is not None
-            ),
-            default=None,
-        )
+        return self._first_deadline()
 
     @property
     def has_background_work(self) -> bool:
@@ -753,4 +813,4 @@ class ProtectionRegistry:
     @property
     def active_claims(self) -> int:
         self._check()
-        return self._active_count
+        return len(self._records)

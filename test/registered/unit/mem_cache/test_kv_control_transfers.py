@@ -410,6 +410,7 @@ def mooncake_store(cache):
 class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
     def test_request_completion_uses_inserted_pages_and_retires_streaming_binding(self):
         from types import SimpleNamespace
+        from test_kv_control_protection import pin_hints
         from test_kv_control_service import FINISH_LENGTH, namespace_request
         from sglang.srt.mem_cache.common import release_kv_cache
 
@@ -429,6 +430,8 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
                 )
                 req = namespace_request(session=session)
                 service.prepare_request(req)
+                service.attach(req, pin_hints(service, selection="request_cached"))
+                self.assertIsNotNone(req.kv_control_context)
                 req.output_ids = cache_fixtures.array("q", [5])
                 req.finished_reason = FINISH_LENGTH(1)
                 cache.req_to_token_pool.alloc([req])
@@ -449,7 +452,7 @@ class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
                         finish.assert_called_once_with(
                             req, committed_len=4, checkpointed=True
                         )
-                self.assertIsNone(req.kv_control_feedback_context)
+                self.assertIsNone(req.kv_control_context)
                 self.assertFalse(req.kv.holds_kv)
                 cache.sanity_check()
 
