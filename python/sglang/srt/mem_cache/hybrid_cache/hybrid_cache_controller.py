@@ -22,6 +22,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
     PrefetchAck,
+    PrefetchCancellation,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -198,7 +199,7 @@ class StorageOperation(BaseStorageOperation):
         self.pool_storage_result = PoolTransferResult.empty()
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchOperation(PrefetchCancellation, StorageOperation):
     def __init__(
         self,
         handle: CacheRequestHandle,
@@ -213,8 +214,6 @@ class PrefetchOperation(StorageOperation):
         self.storage_read_metadata = storage_read_metadata
         self.handle = handle
         self.request_id = handle.rid
-        self._lock = threading.Lock()
-        self._terminated_flag = False
         self.storage_hit_count = 0
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
@@ -246,14 +245,6 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
-
-    def mark_terminate(self):
-        with self._lock:
-            self._terminated_flag = True
-
-    def is_terminated(self) -> bool:
-        with self._lock:
-            return self._terminated_flag
 
 
 @dataclass(frozen=True)
@@ -1032,7 +1023,12 @@ class HybridCacheController(BaseHiCacheController):
         )
         shared = uses_shared_host_layout(self.mem_pool_host.anchor_entry.host_pool)
         if host_indices is None and not shared:
-            evict_host(hit_tokens)
+            reclaim_tokens = hit_tokens
+            if not self.is_kv_sharded and not self.prefetch_completion_sync_groups:
+                # Available rows can satisfy part of a local, unsharded read.
+                reclaim_tokens -= self.mem_pool_host.available_size()
+            if reclaim_tokens > 0:
+                evict_host(reclaim_tokens)
             host_indices = self.alloc_prefetch_host_buffers(
                 operation, hit_tokens, **shard_kwargs
             )
@@ -1742,10 +1738,11 @@ class HybridCacheController(BaseHiCacheController):
         own boundary, named windows included (`_host_pool_schema`), so
         per-pool beliefs stay rank-identical. A pool omitted by any rank
         heals from the folded cut without learning presence."""
-        if any(
+        has_trailing_state = any(
             transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES
             for transfer in operation.pool_transfers or []
-        ):
+        )
+        if has_trailing_state:
             # A trailing state can exist at 512 and 1024 but not at 768. Taking
             # MIN of each rank's longest hit would choose a missing checkpoint,
             # so reduce one restorable flag per prefix length instead. Use the
@@ -1768,17 +1765,20 @@ class HybridCacheController(BaseHiCacheController):
             hits = [storage_hit_count]
         pools = self._host_pool_schema(self.prefetch_hits_sync_groups)
         local = operation.query_pool_hit_pages
-        packed = torch.tensor(
-            hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools],
-            dtype=torch.int,
-        )
-        self._all_reduce(
-            packed,
-            torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
-        )
-        reduced = packed.tolist()
-        storage_hit_count = int(reduced[0])
+        reduced = hits + [local.get(pool, _NO_POOL_VERDICT) for pool in pools]
+        if self.prefetch_hits_sync_groups:
+            packed = torch.tensor(reduced, dtype=torch.int)
+            self._all_reduce(
+                packed, torch.distributed.ReduceOp.MIN, self.prefetch_hits_sync_groups
+            )
+            reduced = packed.tolist()
+        if has_trailing_state:
+            restorable = reduced[: len(hits)]
+            storage_hit_count = (
+                max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+            )
+        else:
+            storage_hit_count = reduced[0]
         if storage_hit_count == 0:
             # A miss is never sent to the transfer worker, so finish its span here.
             _finish_op_trace(operation)
@@ -1787,10 +1787,7 @@ class HybridCacheController(BaseHiCacheController):
             for pool, pages in zip(pools, reduced[len(hits) :], strict=True)
             if pages != _NO_POOL_VERDICT
         }
-        if len(hits) == 1:
-            return storage_hit_count
-        restorable = reduced[: len(hits)]
-        return max(i for i, ok in enumerate(restorable) if ok) * self.page_size
+        return storage_hit_count
 
     def _move_pool_indices(
         self, host_pool, host_indices, device_indices, *, write_back_jit: bool
@@ -2289,17 +2286,16 @@ class HybridCacheController(BaseHiCacheController):
             # On prefetch failure, pool_hits may be an empty dict; a pool this
             # rank does not hold contributes 0.
             names = self._host_pool_schema(self.prefetch_completion_sync_groups)
-            packed = torch.tensor(
-                [ack.pool_hits.get(name, 0) for name in names],
-                dtype=torch.int,
-            )
-            self._all_reduce(
-                packed,
-                torch.distributed.ReduceOp.MIN,
-                self.prefetch_completion_sync_groups,
-            )
-            for i, name in enumerate(names):
-                ack.pool_hits[name] = packed[i].item()
+            counts = [ack.pool_hits.get(name, 0) for name in names]
+            if self.prefetch_completion_sync_groups:
+                packed = torch.tensor(counts, dtype=torch.int)
+                self._all_reduce(
+                    packed,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_completion_sync_groups,
+                )
+                counts = packed.tolist()
+            ack.pool_hits.update(zip(names, counts, strict=True))
 
     def _host_pool_schema(self, groups) -> List[str]:
         """The ordered host-pool names a collective over ``groups`` reduces, the

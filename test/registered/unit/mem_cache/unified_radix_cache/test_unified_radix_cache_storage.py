@@ -1,6 +1,7 @@
 """L3 storage, buffer-only host memory and prefetch tests for UnifiedRadixCache."""
 
 import os
+import threading
 import time
 import unittest
 from array import array
@@ -2904,12 +2905,232 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
         self.assertEqual(actions, [])
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
+class TestLocalReadStaging(UnifiedRadixCacheStorageFixtures, CustomTestCase):
+    cfg = CacheConfig(kv_size=96, max_context_len=128, num_layers=1)
+
+    def _add_host_entry(self, cache, allocator, req_pool, tokens):
+        self._insert(cache, allocator, req_pool, tokens)
+        node = match_prefix(cache, tokens).last_device_node
+        self._backup_node(cache, node)
+        self.assertEqual(
+            cache.evict(EvictParams(num_tokens=len(tokens))).num_tokens_evicted,
+            len(tokens),
+        )
+        return node
+
+    def _setup_read_staging(self, sequences, leave_free):
+        cache, allocator, req_pool = self._l3_consumer(self._make_storage_dir())
+        cc = cache.cache_controller
+        self.assertFalse(cc.prefetch_completion_sync_groups)
+        self.assertFalse(cc.is_kv_sharded)
+        for seq in sequences:
+            node = self._add_host_entry(cache, allocator, req_pool, seq)
+            self._write_path_to_l3(cache, node)
+            self._flush_l3_backups(cache)
+            self.assertEqual(cache.evict_host(len(seq)), len(seq))
+            self.assertEqual(match_prefix(cache, seq).host_hit_length, 0)
+
+        hot = []
+        start = 1000
+        while (remaining := cc.mem_pool_host.available_size() - leave_free) > 0:
+            # Make the oldest entry a two-token eviction victim.
+            size = min(remaining, self.cfg.kv_size if hot else 2)
+            tokens = list(range(start, start + size))
+            self._add_host_entry(cache, allocator, req_pool, tokens)
+            hot.append(tokens)
+            start += size
+        self.assertEqual(cc.mem_pool_host.available_size(), leave_free)
+        self.assertGreater(len(hot), 1)
+        return cache, hot
+
+    def _submit_read(self, cache, request, seq):
+        cache.prefetch_from_storage(
+            request, cache.root_node_handle(), array("q", seq), None, None
+        )
+        self.assertIn(request, cache.ongoing_prefetch)
+        return cache.ongoing_prefetch[request].operation
+
+    def _assert_loaded(self, cache, request, seq):
+        self._run_prefetch_to_completion(cache, request)
+        self.assertEqual(cache.pop_prefetch_loaded_span(request), (len(seq), 0))
+        self.assertEqual(match_prefix(cache, seq).host_hit_length, len(seq))
+        cache.finish(request, CacheRequestOutcome.ABORT)
+
+    def _assert_reads_retired(self, cache):
+        cache.drain_storage_control_queues()
+        self.assertFalse(cache.ongoing_prefetch)
+        self.assertFalse(cache._storage_prefetch_hit_remaining_by_reqid)
+        self.assertEqual(cache.cache_controller.prefetch_tokens_occupied, 0)
+        self.assertTrue(cache.cache_controller.host_mem_release_queue.empty())
+        cache.sanity_check()
+
+    def test_ordinary_restore_defers_staging_and_evicts_only_shortfall(self):
+        seq = list(range(1, 5))
+        cache, hot = self._setup_read_staging([seq], leave_free=2)
+        cc = cache.cache_controller
+        request = CacheRequestHandle("ordinary-shortfall", 0)
+        with mock.patch.object(cache, "evict_host", wraps=cache.evict_host) as evict:
+            with mock.patch.object(cc.prefetch_buffer, "empty", return_value=False):
+                operation = self._submit_read(cache, request, seq)
+                self._pump_hicache_until(
+                    cache,
+                    lambda: (
+                        getattr(operation, "host_allocation_deferred", None) == "io"
+                    ),
+                    "read did not park",
+                )
+                self.assertIsNone(operation.host_indices)
+                self.assertEqual(cc.mem_pool_host.available_size(), 2)
+                evict.assert_not_called()
+            self._assert_loaded(cache, request, seq)
+            evict.assert_called_once_with(2)
+
+        self.assertEqual(match_prefix(cache, hot[0]).host_hit_length, 0)
+        for tokens in hot[1:]:
+            self.assertEqual(match_prefix(cache, tokens).host_hit_length, len(tokens))
+        self._assert_reads_retired(cache)
+
+    def test_completed_read_releases_staging_before_new_host_eviction(self):
+        first, second = [list(range(i, i + 4)) for i in (1, 9)]
+        cache, hot = self._setup_read_staging([first, second], leave_free=4)
+        cc = cache.cache_controller
+        cancelled = CacheRequestHandle("cancelled-reader", 0)
+        next_read = CacheRequestHandle("next-reader", 0)
+        entered, release, finished, queried = [threading.Event() for _ in range(4)]
+        get, put_ack = cc.page_get_func, cc.ack_prefetch_queue.put
+        put_hit = cc.prefetch_hit_queue.put
+
+        def blocked_get(operation, *args, **kwargs):
+            if operation.handle == cancelled:
+                entered.set()
+                self.assertTrue(release.wait(10))
+            return get(operation, *args, **kwargs)
+
+        def observe_ack(ack):
+            put_ack(ack)
+            if ack.operation.handle == cancelled and ack.completed_req:
+                finished.set()
+
+        def observe_hit(operation):
+            put_hit(operation)
+            if operation.handle == next_read:
+                queried.set()
+
+        with (
+            mock.patch.object(cc, "page_get_func", blocked_get),
+            mock.patch.object(cc.ack_prefetch_queue, "put", observe_ack),
+            mock.patch.object(cc.prefetch_hit_queue, "put", observe_hit),
+            mock.patch.object(cache, "evict_host", wraps=cache.evict_host) as evict,
+        ):
+            try:
+                self._submit_read(cache, cancelled, first)
+                self._pump_hicache_until(
+                    cache, entered.is_set, "first read did not start"
+                )
+                cache.finish(cancelled, CacheRequestOutcome.ABORT)
+                self.assertEqual(cc.mem_pool_host.available_size(), 0)
+                self._submit_read(cache, next_read, second)
+                self.assertTrue(queried.wait(10))
+            finally:
+                release.set()
+
+            self.assertTrue(finished.wait(10))
+            self.assertTrue(cc.host_mem_release_queue.empty())
+            cache.drain_storage_control_queues()
+            self._assert_loaded(cache, next_read, second)
+            evict.assert_not_called()
+
+        for tokens in hot:
+            self.assertEqual(match_prefix(cache, tokens).host_hit_length, len(tokens))
+        self._assert_reads_retired(cache)
+
+    def test_queued_reads_park_before_io_is_ready(self):
+        sequences = [list(range(i, i + 24)) for i in (1, 25, 49)]
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                cache, hot = self._setup_read_staging(sequences, leave_free=48)
+                cc = cache.cache_controller
+                requests = [
+                    CacheRequestHandle(f"bounded-read-{i}", 0) for i in range(3)
+                ]
+                entered, release = threading.Event(), threading.Event()
+                get = cc.page_get_func
+                parked_before = cache.prefetch_outcome_stats_snapshot()[
+                    "declined_rate_limited"
+                ]
+
+                def blocked_get(*args, **kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(10))
+                    return get(*args, **kwargs)
+
+                with (
+                    mock.patch.object(cc, "page_get_func", blocked_get),
+                    mock.patch.object(
+                        cache, "evict_host", wraps=cache.evict_host
+                    ) as evict,
+                ):
+                    try:
+                        self._submit_read(cache, requests[0], sequences[0])
+                        self._pump_hicache_until(
+                            cache, entered.is_set, "first read did not start"
+                        )
+                        second = self._submit_read(cache, requests[1], sequences[1])
+                        third = self._submit_read(cache, requests[2], sequences[2])
+                        self._pump_hicache_until(
+                            cache,
+                            lambda: (
+                                getattr(third, "host_allocation_deferred", None) == "io"
+                            ),
+                            "third read did not park",
+                        )
+                        self.assertIsNotNone(second.host_indices)
+                        self.assertIsNone(third.host_indices)
+                        self.assertEqual(cc.prefetch_buffer.qsize(), 1)
+                        self.assertEqual(cc.mem_pool_host.available_size(), 0)
+                        cache.drain_storage_control_queues()
+                        cache.drain_storage_control_queues_local()
+                        self.assertIsNone(third.host_indices)
+                        self.assertEqual(
+                            cache.prefetch_outcome_stats_snapshot()[
+                                "declined_rate_limited"
+                            ],
+                            parked_before + 1,
+                        )
+                        evict.assert_not_called()
+
+                        if cancel:
+                            cache.finish(requests[2], CacheRequestOutcome.ABORT)
+                            self.assertTrue(third.is_terminated())
+                            self.assertNotIn(requests[2], cache.ongoing_prefetch)
+                            self.assertIsNone(third.host_indices)
+                    finally:
+                        release.set()
+
+                    for i in range(2 if cancel else 3):
+                        self._assert_loaded(cache, requests[i], sequences[i])
+                    if cancel:
+                        evict.assert_not_called()
+                        self.assertEqual(
+                            match_prefix(cache, sequences[2]).host_hit_length, 0
+                        )
+                        for tokens in hot:
+                            self.assertEqual(
+                                match_prefix(cache, tokens).host_hit_length,
+                                len(tokens),
+                            )
+
+                self._assert_reads_retired(cache)
+
+
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
     def test_hybrid_prefetch_rejects_partial_host_allocation(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
+            PrefetchOperation,
         )
 
         for component, pool in (
@@ -2936,13 +3157,12 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                     return list(range(num_tokens)) if num_tokens <= 4 else None
 
                 cc.alloc_prefetch_host_buffers.side_effect = allocate_host_buffers
-                operation = mock.Mock()
-                operation.handle = CacheRequestHandle("hybrid-capacity", 0)
+                operation = PrefetchOperation(
+                    CacheRequestHandle("hybrid-capacity", 0), list(range(8))
+                )
                 operation.storage_start = 4
                 operation.storage_hit_count = 8
                 operation.hash_value = ["h1", "h2"]
-                operation.host_indices = None
-                operation.is_terminated.return_value = False
                 cache.ongoing_prefetch = {
                     operation.handle: _OngoingPrefetch(
                         anchor_node_id=0,
