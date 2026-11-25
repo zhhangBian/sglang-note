@@ -1,0 +1,775 @@
+{
+  "base": {
+    "action_id": "a",
+    "action_type": "sglang.prefetch",
+    "action_version": "1.0",
+    "payload": {
+      "target": {
+        "kind": "prefix",
+        "compatibility": {
+          "namespace": "ns",
+          "cache_salt": null,
+          "layout_id": "python:full:p4:w0",
+          "page_size": 4,
+          "components": [
+            "full"
+          ],
+          "hash_scheme": "sglang.sha256.u32le.i64.v1"
+        },
+        "start_token": 0,
+        "end_token": 4,
+        "token_ids": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
+      },
+      "source": {
+        "tier": "storage",
+        "backend": "file"
+      },
+      "destination": {
+        "tier": "host",
+        "engine_id": "engine"
+      },
+      "allow_partial": false,
+      "timeout_ms": 5000
+    }
+  },
+  "cases": [
+    {
+      "name": "token_prefix_i64_min",
+      "valid": true,
+      "replace": {}
+    },
+    {
+      "name": "i64_max",
+      "valid": true,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "9223372036854775807"
+      }
+    },
+    {
+      "name": "hash_only_schema_not_executable",
+      "valid": true,
+      "replace": {
+        "/payload/target": {
+          "kind": "prefix",
+          "compatibility": {
+            "namespace": "ns",
+            "cache_salt": null,
+            "layout_id": "python:full:p4:w0",
+            "page_size": 4,
+            "components": [
+              "full"
+            ],
+            "hash_scheme": "sglang.sha256.u32le.i64.v1"
+          },
+          "start_token": 0,
+          "end_token": 4,
+          "blocks": [
+            {
+              "block_hash": "-9223372036854775808",
+              "component": "full",
+              "start_token": 0,
+              "end_token": 4
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unicode_salt",
+      "valid": true,
+      "replace": {
+        "/payload/target/compatibility/cache_salt": "租户😀\u0000\"\\"
+      }
+    },
+    {
+      "name": "demote",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.demote",
+        "/payload/source": {
+          "tier": "host",
+          "engine_id": "engine"
+        },
+        "/payload/destination": {
+          "tier": "storage",
+          "backend": "file"
+        }
+      }
+    },
+    {
+      "name": "pin_acquire",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "priority": -2147483648
+        }
+      }
+    },
+    {
+      "name": "pin_renew",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "renew",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60
+        }
+      }
+    },
+    {
+      "name": "pin_release",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "release",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion"
+        }
+      }
+    },
+    {
+      "name": "legacy_tokens",
+      "valid": true,
+      "replace": {
+        "/payload/target": {
+          "kind": "tokens",
+          "namespace": "ns",
+          "token_ids": [
+            1,
+            2,
+            3,
+            4
+          ]
+        }
+      }
+    },
+    {
+      "name": "legacy_session",
+      "valid": false,
+      "replace": {
+        "/payload/target": {
+          "kind": "session",
+          "namespace": "ns",
+          "session_id": "s"
+        }
+      }
+    },
+    {
+      "name": "legacy_content",
+      "valid": false,
+      "replace": {
+        "/payload/target": {
+          "kind": "content",
+          "namespace": "ns",
+          "token_count": 4,
+          "components": [
+            "full"
+          ],
+          "spans": [
+            {
+              "content_id": "c",
+              "component": "full",
+              "start_token": 0,
+              "end_token": 4
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "bad_hash_9223372036854775808",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "9223372036854775808"
+      }
+    },
+    {
+      "name": "bad_hash_-9223372036854775809",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "-9223372036854775809"
+      }
+    },
+    {
+      "name": "bad_hash_01",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "01"
+      }
+    },
+    {
+      "name": "bad_hash_-0",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "-0"
+      }
+    },
+    {
+      "name": "bad_hash_+1",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "+1"
+      }
+    },
+    {
+      "name": "bad_hash_1.0",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "1.0"
+      }
+    },
+    {
+      "name": "bad_hash_1\n",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": "1\n"
+      }
+    },
+    {
+      "name": "bad_hash_9007199254740992",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/block_hash": 9007199254740992
+      }
+    },
+    {
+      "name": "bad_start_token1",
+      "valid": false,
+      "replace": {
+        "/payload/target/start_token": 1
+      }
+    },
+    {
+      "name": "bad_end_token0",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 0
+      }
+    },
+    {
+      "name": "bad_end_token8",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 8
+      }
+    },
+    {
+      "name": "bad_end_token9007199254740992",
+      "valid": false,
+      "replace": {
+        "/payload/target/end_token": 9007199254740992
+      }
+    },
+    {
+      "name": "bad_start_tokenFalse",
+      "valid": false,
+      "replace": {
+        "/payload/target/start_token": false
+      }
+    },
+    {
+      "name": "bad_token_ids[4294967296, 4294967296, 4294967296, 4294967296]",
+      "valid": false,
+      "replace": {
+        "/payload/target/token_ids": [
+          4294967296,
+          4294967296,
+          4294967296,
+          4294967296
+        ]
+      }
+    },
+    {
+      "name": "bad_compat_page_size",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/page_size": 0
+      }
+    },
+    {
+      "name": "bad_compat_components",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/components": [
+          "full",
+          "full"
+        ]
+      }
+    },
+    {
+      "name": "bad_compat_namespace",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/namespace": ""
+      }
+    },
+    {
+      "name": "bad_compat_layout_id",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/layout_id": ""
+      }
+    },
+    {
+      "name": "bad_compat_cache_salt",
+      "valid": false,
+      "replace": {
+        "/payload/target/compatibility/cache_salt": true
+      }
+    },
+    {
+      "name": "bad_block_dependency_start",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4,
+            "dependency_start": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "bad_block_component",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/component": "mamba"
+      }
+    },
+    {
+      "name": "bad_block_end_token",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks/0/end_token": 8
+      }
+    },
+    {
+      "name": "overlapping_blocks",
+      "valid": false,
+      "replace": {
+        "/payload/target/blocks": [
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          },
+          {
+            "block_hash": "-9223372036854775808",
+            "component": "full",
+            "start_token": 0,
+            "end_token": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "bad_transfer_timeout_ms",
+      "valid": false,
+      "replace": {
+        "/payload/timeout_ms": 0
+      }
+    },
+    {
+      "name": "bad_transfer_timeout_ms",
+      "valid": false,
+      "replace": {
+        "/payload/timeout_ms": true
+      }
+    },
+    {
+      "name": "bad_transfer_allow_partial",
+      "valid": false,
+      "replace": {
+        "/payload/allow_partial": 1
+      }
+    },
+    {
+      "name": "bad_transfer_deadline",
+      "valid": false,
+      "replace": {
+        "/payload": {
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "source": {
+            "tier": "storage",
+            "backend": "file"
+          },
+          "destination": {
+            "tier": "host",
+            "engine_id": "engine"
+          },
+          "allow_partial": false,
+          "timeout_ms": 5000,
+          "deadline": 10
+        }
+      }
+    },
+    {
+      "name": "wrong_prefetch_direction",
+      "valid": false,
+      "replace": {
+        "/payload/source": {
+          "tier": "gpu"
+        }
+      }
+    },
+    {
+      "name": "engine_backend",
+      "valid": false,
+      "replace": {
+        "/payload/destination": {
+          "tier": "host",
+          "engine_id": "engine",
+          "backend": "file"
+        }
+      }
+    },
+    {
+      "name": "release_with_ttl",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "release",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "ttl_seconds": 60
+        }
+      }
+    },
+    {
+      "name": "pin_explicit_local_owner",
+      "valid": true,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 7
+          }
+        }
+      }
+    },
+    {
+      "name": "pin_owner_incarnation_overflow",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 9007199254740992
+          }
+        }
+      }
+    },
+    {
+      "name": "pin_owner_rejects_unknown_fields",
+      "valid": false,
+      "replace": {
+        "/action_type": "sglang.pin",
+        "/payload": {
+          "mode": "acquire",
+          "target": {
+            "kind": "prefix",
+            "compatibility": {
+              "namespace": "ns",
+              "cache_salt": null,
+              "layout_id": "python:full:p4:w0",
+              "page_size": 4,
+              "components": [
+                "full"
+              ],
+              "hash_scheme": "sglang.sha256.u32le.i64.v1"
+            },
+            "start_token": 0,
+            "end_token": 4,
+            "token_ids": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "blocks": [
+              {
+                "block_hash": "-9223372036854775808",
+                "component": "full",
+                "start_token": 0,
+                "end_token": 4
+              }
+            ]
+          },
+          "location": {
+            "tier": "host"
+          },
+          "claim_id": "c",
+          "revision": 3,
+          "required_protection": "eviction_exclusion",
+          "ttl_seconds": 60,
+          "owner_task": {
+            "session_id": "task",
+            "incarnation": 7,
+            "caller_id": "other"
+          }
+        }
+      }
+    }
+  ]
+}
