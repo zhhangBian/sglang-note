@@ -12,7 +12,7 @@ import json
 import unittest
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
@@ -89,6 +89,131 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.sc = OpenAIServingCompletion(tm, self.template_manager)
         self.fastapi_request = Mock(spec=Request)
 
+    def test_http_inference_authorizes_only_exact_native_hint_actions(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        from httpx import ASGITransport, AsyncClient
+        from sglang.srt.entrypoints import http_server
+        from sglang.srt.managers.kv_hints import decode_kv_hints_envelope
+
+        received = []
+
+        async def handle(req, raw_request):
+            received.append(req.kv_hints)
+            return {"ok": True}
+
+        async def generate(req, raw_request):
+            yield await handle(req, raw_request)
+
+        async def exercise():
+            async with AsyncClient(
+                transport=ASGITransport(app=http_server.app), base_url="http://engine"
+            ) as client:
+                for route, body in (
+                    ("/v1/completions", {"model": "m", "prompt": "a"}),
+                    (
+                        "/v1/chat/completions",
+                        {"model": "m", "messages": [{"role": "user", "content": "a"}]},
+                    ),
+                    ("/generate", {"text": ["a", "b"]}),
+                ):
+                    for name, version, native in (
+                        ("sglang.pin", "1.0", True),
+                        ("sglang.demote", "1.0", False),
+                        ("sglang.prefetch", "1.0", False),
+                        ("sglang.pin", "2.0", False),
+                        ("sglang.other", "1.0", False),
+                        ("backend.hint", "1.0", False),
+                    ):
+                        envelope = {
+                            "protocol_version": "0.1",
+                            "message_id": "m",
+                            "actions": [
+                                {
+                                    "action_id": "a",
+                                    "action_type": name,
+                                    "action_version": version,
+                                    "payload": {
+                                        "target": {
+                                            "kind": "tokens",
+                                            "namespace": "ns",
+                                            "token_ids": [1, 2, 3, 4],
+                                        }
+                                    },
+                                }
+                            ],
+                        }
+                        body["kv_hints"] = (
+                            [None, envelope] if route == "/generate" else envelope
+                        )
+                        for user_key, admin_key, headers, expected in (
+                            (
+                                "user",
+                                "admin",
+                                {"Authorization": "Bearer user"},
+                                403 if native else 200,
+                            ),
+                            (
+                                "user",
+                                "admin",
+                                {
+                                    "Authorization": "Bearer user",
+                                    "X-SGLang-Admin-Authorization": "Bearer admin",
+                                },
+                                200,
+                            ),
+                            (None, "admin", {"Authorization": "Bearer admin"}, 200),
+                            ("user", None, {"Authorization": "Bearer user"}, 200),
+                        ):
+                            with (
+                                self.subTest(
+                                    route=route,
+                                    action=name,
+                                    version=version,
+                                    expected=expected,
+                                ),
+                                get_context().override_server_args(
+                                    api_key=user_key, admin_api_key=admin_key
+                                ),
+                            ):
+                                received.clear()
+                                reply = await client.post(
+                                    route, json=body, headers=headers
+                                )
+                                self.assertEqual(
+                                    reply.status_code, expected, reply.text
+                                )
+                                self.assertEqual(len(received), int(expected == 200))
+                                if expected == 200:
+                                    hint = received[0]
+                                    if route == "/generate":
+                                        hint = hint[1]
+                                    self.assertEqual(
+                                        decode_kv_hints_envelope(hint),
+                                        decode_kv_hints_envelope(envelope),
+                                    )
+
+        handler = SimpleNamespace(
+            handle_request=handle, chat_wire=Mock(error_body=lambda error: None)
+        )
+        with (
+            patch.object(
+                http_server.app.state, "openai_serving_completion", handler, create=True
+            ),
+            patch.object(
+                http_server.app.state, "openai_serving_chat", handler, create=True
+            ),
+            patch.object(
+                http_server,
+                "_global_state",
+                SimpleNamespace(
+                    tokenizer_manager=SimpleNamespace(generate_request=generate)
+                ),
+            ),
+        ):
+            asyncio.run(exercise())
+
     def test_validate_request_bounds_logprobs_to_vocab(self):
         """logprobs outside [0, vocab_size] must be a 400, not a topk that
         kills the scheduler."""
@@ -116,10 +241,23 @@ class ServingCompletionTestCase(unittest.TestCase):
             max_tokens=1,
             cache_salt="tenant-a",
             extra_key="classification",
+            kv_hints={
+                "protocol_version": "0.1",
+                "message_id": "keep",
+                "actions": [
+                    {
+                        "action_id": "external",
+                        "action_type": "backend.action",
+                        "action_version": "9",
+                        "payload": {"key": [1, 2]},
+                    }
+                ],
+            },
         )
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
+        self.assertEqual(internal.kv_hints, req.kv_hints)
 
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
