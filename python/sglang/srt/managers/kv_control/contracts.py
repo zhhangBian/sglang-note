@@ -214,6 +214,22 @@ class PublicLocation(Value):
 PublicTarget: TypeAlias = Target | PrefixTarget
 
 
+class TransferPayload(Value):
+    target: PublicTarget
+    source: PublicLocation
+    destination: PublicLocation
+    allow_partial: bool = False
+    timeout_ms: Annotated[int, msgspec.Meta(ge=1, le=86400000)] | None = None
+
+
+class Prefetch(TransferPayload):
+    pass
+
+
+class Demote(TransferPayload):
+    pass
+
+
 class Pin(Value):
     mode: Literal["acquire", "renew", "release"]
     target: PublicTarget
@@ -251,7 +267,7 @@ class ClaimState(Value):
     location: PublicLocation | None = None
 
 
-Payload: TypeAlias = Pin
+Payload: TypeAlias = Prefetch | Demote | Pin
 
 
 class Status(str, Enum):
@@ -440,35 +456,61 @@ def validate_prefix(target: PrefixTarget) -> None:
         previous[block.component] = block.end_token
 
 
-def validate_public(payload: Pin):
-    location = payload.location
-    if location.tier != "host":
-        raise ControlError("unsupported", "PIN requires a host location")
-    if location.backend is not None or location.backend_namespace is not None:
-        raise ControlError("invalid_payload", "Engine tiers cannot name a backend")
-    if (payload.mode == "release") != (
-        payload.ttl_seconds is None and payload.priority is None
-    ):
-        raise ControlError(
-            "invalid_payload",
-            "Acquire/renew require TTL or priority; release omits both",
+def validate_public(payload):
+    if isinstance(payload, Pin):
+        if payload.location.tier != "host":
+            raise ControlError("unsupported", "PIN requires a host location")
+        if (payload.mode == "release") != (
+            payload.ttl_seconds is None and payload.priority is None
+        ):
+            raise ControlError(
+                "invalid_payload",
+                "Acquire/renew require TTL or priority; release omits both",
+            )
+        if payload.ttl_seconds is not None and not math.isfinite(payload.ttl_seconds):
+            raise ControlError("invalid_payload", "TTL must be finite")
+        locations = (payload.location,)
+    else:
+        locations = (payload.source, payload.destination)
+        path = (payload.source.tier, payload.destination.tier)
+        expected = (
+            ("host", "storage") if isinstance(payload, Demote) else ("storage", "host")
         )
-    if payload.ttl_seconds is not None and not math.isfinite(payload.ttl_seconds):
-        raise ControlError("invalid_payload", "TTL must be finite")
+        if "gpu" in path:
+            raise ControlError(
+                "unsupported", "Explicit transfers require host and storage"
+            )
+        if path != expected:
+            raise ControlError("invalid_payload", "Invalid public transfer direction")
+    for location in locations:
+        if location.tier == "storage":
+            if location.engine_id is not None:
+                raise ControlError(
+                    "invalid_payload", "Storage locations cannot name an engine"
+                )
+        elif location.backend is not None or location.backend_namespace is not None:
+            raise ControlError("invalid_payload", "Engine tiers cannot name a backend")
 
 
-_ACTION_SCHEMAS = {("sglang.pin", ACTION_VERSION): Pin}
-PUBLIC_ACTIONS = tuple(name for name, _ in _ACTION_SCHEMAS)
+_ACTION_SCHEMAS = {
+    "sglang.prefetch": Prefetch,
+    "sglang.demote": Demote,
+    "sglang.pin": Pin,
+}
+PUBLIC_ACTIONS = tuple(_ACTION_SCHEMAS)
 
 
 def is_native_action(action: KvHintAction) -> bool:
-    return (action.action_type, action.action_version) in _ACTION_SCHEMAS
+    return (
+        action.action_version == ACTION_VERSION
+        and action.action_type in _ACTION_SCHEMAS
+    )
 
 
 def parse_action(action: KvHintAction) -> Payload:
     """Interpret a supported action after generic forwarding has selected its owner."""
-    schema = _ACTION_SCHEMAS.get((action.action_type, action.action_version))
-    if schema is None:
+    schema = _ACTION_SCHEMAS.get(action.action_type)
+    if schema is None or action.action_version != ACTION_VERSION:
         raise ControlError("unsupported", "Unsupported native action or action version")
     payload = validated(action.payload, schema)
     if payload.target != "request_cached":

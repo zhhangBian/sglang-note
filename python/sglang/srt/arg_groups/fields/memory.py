@@ -25,11 +25,7 @@ class Memory(msgspec.Struct):
     kv_control_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            cli_name="--enable-kv-cache-control",
-            help=(
-                "Enable host KV cache PIN protection with a JSON object containing "
-                "the model/weight namespace, optional engine_id and bounded limits."
-            ),
+            help="Enable session-aware KV cache control (PIN, PREFETCH, DEMOTE) with a JSON object containing the model/weight namespace, optional engine_id and bounded limits.",
             type_parser=json.loads,
         ),
     ] = None

@@ -797,7 +797,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             )
             newer = msgspec.structs.replace(pin, action_version="2.0")
             future = [
-                msgspec.structs.replace(pin, action_type=f"sglang.{name}")
+                msgspec.structs.replace(newer, action_type=f"sglang.{name}")
                 for name in ("prefetch", "demote")
             ]
             unowned = [external, *future, newer]

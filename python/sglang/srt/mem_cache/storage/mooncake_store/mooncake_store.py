@@ -1514,12 +1514,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i in range(0, len(element_size_list), nbuf)
         ]
 
+    @staticmethod
+    def mha_page_keys(keys, shard):
+        return [f"{key}_{shard}_{part}" for key in keys for part in ("k", "v")]
+
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
-        key_list = []
-        for key_ in keys:
-            key_list.append(f"{key_}_{self.mha_suffix}_k")
-            key_list.append(f"{key_}_{self.mha_suffix}_v")
+        key_list = self.mha_page_keys(keys, self.mha_suffix)
         if len(key_list) != len(ptr_list):
             raise RuntimeError(
                 "Mooncake layer_first multi-buffer is only supported for MLA "
@@ -1838,6 +1839,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def exists(self, key) -> bool:
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
+
+    def verify_backup_prefix(self, keys, host_indices, extra_info):
+        """Certify each physical object before the worker releases its L2 source."""
+        if not keys:
+            return 0
+        tagged = self._tag_keys(keys)
+        objects, _, sizes = self._batch_preprocess(tagged, host_indices)
+        per_page = len(objects) // len(keys)
+        get_size = getattr(self.store, "get_size", None)
+        with self.request_context(**self._request_context_from_extra_info(extra_info)):
+            for i, (key, size) in enumerate(zip(objects, sizes, strict=True)):
+                expected = sum(size) if isinstance(size, Sequence) else size
+                # Older bindings can verify the object through a regular GET.
+                if get_size is None:
+                    value = self.store.get(key)
+                    actual = len(value) if value is not None else 0
+                else:
+                    actual = get_size(key)
+                # The GET buffer must fit the entire object, and a short
+                # object leaves part of that buffer uninitialized.
+                if actual != expected:
+                    return i // per_page
+        return len(keys)
 
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
