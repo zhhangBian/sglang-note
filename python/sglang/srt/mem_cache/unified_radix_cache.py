@@ -240,6 +240,27 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        self._kv_control_unsupported_reason = ""
+        self._kv_control_owner_thread = (
+            threading.get_ident() if params.kv_control_config is not None else None
+        )
+        if params.kv_control_config is not None:
+            if params.is_eagle or params.pp_size != 1 or params.attn_cp_size != 1:
+                self._kv_control_unsupported_reason = (
+                    "Speculative, pipeline and context parallel caches are unsupported"
+                )
+            elif (
+                params.mtp_draft_device_pools
+                or params.mtp_draft_mamba_pools
+                or params.enable_mamba_extra_buffer
+                or params.enable_mamba_extra_buffer_lazy
+                or params.decoder_swa_bounded_replay
+                or not params.swa_gates_prefix_match
+                or page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
+            ):
+                self._kv_control_unsupported_reason = (
+                    "Auxiliary/draft/sharded cache layouts are unsupported"
+                )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -499,6 +520,16 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         self.linker = UnifiedCacheLinkerWrapper(self, cache_linker)
 
+    def create_kv_control_executor(self, *, engine_id: str, engine_epoch: str):
+        """Bind native control to this opted-in cache on the scheduler owner."""
+        from sglang.srt.mem_cache.unified_cache.kv_control_adapter import (
+            UnifiedCacheExecutor,
+        )
+
+        return UnifiedCacheExecutor(
+            self, engine_id=engine_id, engine_epoch=engine_epoch
+        )
+
     def reset(self) -> None:
         if self.linker is not None:
             self.linker.reset()
@@ -506,6 +537,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.invalidate_protection(reason="cache_reset")
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
@@ -686,6 +720,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.invalidate_protection(reason="host_cache_detached")
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
@@ -1630,10 +1667,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.state.release(self.req_to_token_pool, req)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
-    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> Optional[int]:
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
-            return
-        self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            return None
+        return self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
     def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
         mamba = self.components.get(ComponentType.MAMBA)
@@ -1650,15 +1687,15 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         )
 
-    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
-        """Insert ``[cache_protected_len, up_to)`` of the request's record and
-        move its tree lock onto the node the insert ended on."""
+    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> int:
+        """Insert the eligible prefix, move the tree lock, and return its length."""
         is_finished = req.finished()
-        self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        inserted = self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
         if is_finished:
             self._release_request_mamba(req)
+        return inserted
 
-    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> int:
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -1668,7 +1705,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if is_finished:
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
-            return
+            return 0
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -1720,7 +1757,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
                 )
-            return
+            return 0
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
@@ -1760,7 +1797,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
                 )
-            return
+            return 0
         req.kv.record_insert(page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output
@@ -1852,7 +1889,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and effective_cache_len < len(token_ids)
             and up_to >= len(req.origin_input_ids)
         ):
-            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            return self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        return page_aligned_len
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -1959,6 +1997,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self, host_frees: dict[ComponentType, list[torch.Tensor]]
     ) -> None:
         # Free per component host-pool slots, consuming each entry as it frees.
+        if host_frees.get(BASE_COMPONENT_TYPE):
+            service = getattr(self, "kv_control_service", None)
+            if service is not None:
+                service.host_protection_evicted(host_frees[BASE_COMPONENT_TYPE])
         for ct in list(host_frees):
             self.components[ct].free_host_values(host_frees.pop(ct))
 
@@ -1970,6 +2012,11 @@ class UnifiedRadixCache(BasePrefixCache):
             # The tree never holds host values in buffer mode, and staging
             # is operation-owned (freed at each ack): nothing is evictable.
             return 0
+        service = getattr(self, "kv_control_service", None)
+        if service is not None:
+            service.progress_protection(
+                limit=service.config.protection_limits.max_claims
+            )
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
         return result.tracker.get(component_type, 0)
