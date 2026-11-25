@@ -1252,7 +1252,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ex = all_exists[start:end]
             if key_multiplier > 0:
                 page_exists = [
-                    all(
+                    (i + 1) * key_multiplier <= len(ex)
+                    and all(
                         r == 1
                         for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
@@ -1346,6 +1347,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return {}
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
+        if exist_result is not None and len(exist_result) != len(all_key_strs):
+            return {transfer.name: [False] * len(transfer.keys) for transfer in transfers}
         for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,
@@ -1395,6 +1398,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_key_strs, all_ptrs, all_sizes
             )
 
+        if not is_set:
+            io_results = self._validate_read_sizes(io_results, all_sizes)
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
             results[name] = self._batch_postprocess(
@@ -1608,6 +1613,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for group in result_groups
         ]
 
+    @staticmethod
+    def _validate_read_sizes(results, sizes):
+        # A positive short read leaves part of a K/V object uninitialized.
+        # The completion contract requires every byte, including all buffers.
+        return [
+            results[i]
+            if i < len(results)
+            and results[i] == (sum(size) if isinstance(size, Sequence) else size)
+            else -1
+            for i, size in enumerate(sizes)
+        ]
+
     def batch_get_v1(
         self,
         keys: List[str],
@@ -1636,13 +1653,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        if self.unified_suffixes is not None:
-            # Mooncake reads a shorter object into a larger buffer and reports
-            # success; the rest of that chunk's span would keep stale bytes.
-            get_results = [
-                result if result == size else -1
-                for result, size in zip(get_results, buffer_sizes)
-            ]
+        get_results = self._validate_read_sizes(get_results, buffer_sizes)
         return self._batch_postprocess(get_results, is_set_operate=False)
 
     def batch_set_v1(
@@ -1673,6 +1684,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 else None
             )
             exist_result = self._batch_exist(key_strs)
+            if len(exist_result) != len(key_strs):
+                return [False] * len(keys)
 
             set_keys = []
             set_buffer_ptrs = []
@@ -1711,8 +1724,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.backup_pgs.append(backup_pages)
                     self.backup_bandwidth.append(backup_gb / (end_time - start_time))
 
-                for i in range(len(set_indices)):
-                    set_results[set_indices[i]] = put_results[i]
+                for i, result in zip(set_indices, put_results):
+                    set_results[i] = result
 
             return self._batch_postprocess(set_results, is_set_operate=True)
 
@@ -1726,12 +1739,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Only support zero copy set for now
         assert target_location is not None and target_sizes is not None
         exist_result = self._batch_exist([key])
+        if len(exist_result) != 1:
+            return False
         if exist_result[0] == 1:
             return True
         put_result = self._put_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
         )
-        return put_result[0] == 0
+        return len(put_result) == 1 and put_result[0] == 0
 
     def batch_set(
         self,
@@ -1756,16 +1771,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 return False
 
         exist_result = self._batch_exist(keys)
+        if len(exist_result) != len(keys):
+            return False
         set_keys = []
         set_target_locations = []
         set_target_sizes = []
-        set_indices = []
         for i in range(len(keys)):
             if exist_result[i] != 1:
                 set_keys.append(keys[i])
                 set_target_locations.append(target_locations[i])
                 set_target_sizes.append(target_sizes[i])
-                set_indices.append(i)
         # Only set non-existing keys to storage
         start_time = time.perf_counter()
         put_result = self._put_batch_zero_copy_impl(
@@ -1779,17 +1794,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(set_keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        for i in range(len(set_indices)):
-            if put_result[i] == 0:
-                exist_result[set_indices[i]] = 1
-
-        success_count = 0
-        for i in range(len(keys)):
-            if exist_result[i] == 0:
-                break
-            success_count += 1
-        # TODO: return the number of consecutive successful operations from the start.
-        return success_count == len(keys)
+        return len(put_result) == len(set_keys) and all(r == 0 for r in put_result)
 
     def get(
         self,
@@ -1801,7 +1806,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         get_result = self._get_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
         )
-        return get_result[0] >= 0
+        return self._validate_read_sizes(get_result, [target_sizes])[0] > 0
 
     def batch_get(
         self,
@@ -1830,8 +1835,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        for i in range(len(keys)):
-            if get_result[i] < 0:
+        for i, result in enumerate(self._validate_read_sizes(get_result, target_sizes)):
+            if result < 0:
                 return i // key_multiplier
         return len(keys) // key_multiplier
 
@@ -1869,7 +1874,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
-            if exist_result[i] != 1:
+            if i >= len(exist_result) or exist_result[i] != 1:
                 return i // key_multiplier
         return len(query_keys) // key_multiplier
 
