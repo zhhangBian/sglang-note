@@ -21,6 +21,8 @@ from sglang.srt.managers.kv_control.contracts import (
     Location,
     OperationRef,
     Position,
+    PublicLocation,
+    PublicTarget,
     TaskIdentity,
     TokensTarget,
     Value,
@@ -40,6 +42,8 @@ from sglang.srt.mem_cache.unified_cache.control_state import CacheControlConfig
 class CacheLimits(Value):
     max_query_nodes: int = 4096
     max_result_targets: int = 4096
+    max_prepared_prefixes: int = 128
+    max_concurrent_storage_reads: Annotated[int, msgspec.Meta(ge=1, le=64)] = 4
 
 
 class ServiceConfig(Value):
@@ -146,6 +150,12 @@ class Residency(Value, tag="residency", tag_field="kind"):
     location: Location = Location(tier="gpu")
 
 
+class StorageTargets(Value, tag="storage_targets", tag_field="kind"):
+    context: ControlContext
+    target: PublicTarget
+    location: PublicLocation
+
+
 class Capacity(Value, tag="capacity", tag_field="kind"):
     context: ControlContext
 
@@ -170,6 +180,7 @@ Command = (
     | Ack
     | Cancel
     | Residency
+    | StorageTargets
     | Capacity
     | Claim
     | ClaimEvents
@@ -257,6 +268,16 @@ class KVControlService:
                 raise ControlError(*failed)
         return result
 
+    def all_shards_ready(self, ready: bool) -> bool:
+        if self.tp_group is None:
+            return ready
+        import torch
+        import torch.distributed as dist
+
+        vote = torch.tensor(int(ready), dtype=torch.int32, device="cpu")
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=self.tp_group)
+        return bool(vote.item())
+
     def cache_watermark(self):
         recorder = self.cache.tree_core.kv_events
         return CacheWatermark(
@@ -335,7 +356,10 @@ class KVControlService:
 
     @property
     def has_pending(self):
-        return self.control.registry.capacity()["active"] != 0
+        reads = self.control.executor.storage_reads
+        return self.control.registry.capacity()["active"] != 0 or (
+            reads is not None and bool(reads.jobs or reads.demands)
+        )
 
     @property
     def has_background_work(self):
@@ -364,6 +388,8 @@ class KVControlService:
             protection.host_evicted(values)
 
     def progress(self):
+        if self.has_pending:
+            self.control.progress(background=True)
         self.progress_protection()
 
     def reset_after_cache_flush(self):
@@ -394,7 +420,8 @@ class KVControlService:
         )
         unsupported |= getattr(req, "lora_id", None) is not None
         unsupported |= getattr(req, "multimodal_inputs", None) is not None
-        # Retain the request binding so retirement can settle queued PINs.
+        # Refuse this request's physical work without removing the owner that
+        # must still cancel/drain existing transfers on logical task cleanup.
         submission = self.control.submit(
             envelope, context, execute_primitives=not unsupported
         )
@@ -470,6 +497,13 @@ class KVControlService:
             command.ref.context if isinstance(command, Cancel) else command.context
         )
         registry.validate_context(context)
+        if isinstance(command, StorageTargets):
+            if command.target == "request_cached" or command.location.tier != "storage":
+                raise ControlError(
+                    "invalid_payload",
+                    "Storage descriptions require a definite target and storage location",
+                )
+            return control.executor.storage_targets(command.target, command.location)
         if isinstance(command, Submit):
             if context.binding_id is not None:
                 raise ControlError(
@@ -544,7 +578,9 @@ class KVControlService:
             }
         return {
             "operations": registry.capacity(),
-            "storage_reads": None,
+            "storage_reads": self.cache.prefetch_outcome_stats_snapshot()
+            if control.executor.storage_reads is not None
+            else None,
             "protection": {
                 "active_claims": control.executor.protection.registry.active_claims,
                 "protected_tokens": control.executor.protection.registry.protected_tokens,

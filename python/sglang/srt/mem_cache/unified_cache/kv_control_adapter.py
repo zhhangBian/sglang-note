@@ -13,15 +13,19 @@ import msgspec
 from sglang.srt.managers.kv_control.contracts import (
     ContentSpan,
     ControlError,
+    ExecutionUpdate,
     Location,
+    Prefetch,
     ResolvedTarget,
     Status,
     TargetOutcome,
     TokenRange,
     Value,
     cache_compatibility,
+    resolve_prefix,
     validated,
 )
+from sglang.srt.managers.kv_control.controller import ExecutionRequest
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.control_state import CopySelection
@@ -43,6 +47,12 @@ class ResidencySnapshot(Value):
     observed_at: float
     items: tuple[ResidencyEntry, ...]
     missing: tuple[TargetOutcome, ...]
+
+
+class _StorageScope(Value):
+    payload: Prefetch
+    target: ResolvedTarget
+    max_result_targets: int
 
 
 @dataclass(frozen=True)
@@ -92,10 +102,30 @@ class UnifiedCacheExecutor:
         self.generation = self.control_state.generation
         self._thread = threading.get_ident()
         self.cache_salt_transform = None
+        self.storage = None
+        self.storage_adapter = None
+        self.storage_reason = "Storage is not attached"
+        self.storage_reads = None
         self.protection = None
         self.host_control = (
-            self.core.enable_hicache and not self._host_unsupported_reason()
+            self.core.enable_hicache and not self._transfer_unsupported_reason()
         )
+        if self.host_control:
+            self._refresh_storage_adapter()
+
+    def _storage_prefix(self, work):
+        self._check(work.target)
+        scope = work.target
+        end = scope.requested.end_token
+        if scope.requested.start_token or end % self.core.page_size:
+            raise ControlError(
+                "unsupported", "Storage control requires a page-aligned whole prefix"
+            )
+        if end // self.core.page_size > self.config.max_query_nodes:
+            raise ControlError(
+                "capacity", "Transfer scope exceeds its page traversal budget"
+            )
+        return scope.content.token_ids[:end], self._compatibility(scope.content)
 
     def _load_pending(self, node):
         if node.load_back_pending_id is not None:
@@ -109,14 +139,80 @@ class UnifiedCacheExecutor:
                 current = current.parent
         return False
 
-    def _host_unsupported_reason(self):
+    def _hold_host(self, holds, nodes):
+        known = {node_id for node_id, _ in holds}
+        for node in nodes:
+            if (
+                node.id not in known
+                and node.component_data[ComponentType.FULL].host_value is not None
+            ):
+                receipt = self.cache.inc_host_lock_ref(node.id).to_dec_params()
+                holds.append((node.id, receipt))
+
+    def _release_host(self, holds):
+        for node_id, receipt in reversed(holds):
+            self.cache.dec_host_lock_ref(node_id, receipt)
+        holds.clear()
+
+    def _refresh_storage_adapter(self):
+        from sglang.srt.mem_cache.unified_cache.storage_execution import (
+            storage_execution_adapter,
+        )
+
+        adapter, reason = (None, "Storage is not attached")
+        if self.host_control and self.cache.enable_storage:
+            adapter, reason = storage_execution_adapter(self.cache)
+        changed = self.storage_adapter is not None and (
+            adapter is None
+            or adapter.store is not self.storage_adapter.store
+            or adapter.backend_namespace != self.storage_adapter.backend_namespace
+        )
+        if changed and self.storage is not None:
+            if (
+                self.storage.jobs
+                or self.storage.interests
+                or self.storage_reads.jobs
+                or self.storage_reads.interests
+                or self.storage_reads.demands
+            ):
+                raise ControlError(
+                    "busy", "Storage control must drain before replacing its adapter"
+                )
+        self.storage_adapter, self.storage_reason = adapter, reason
+        enabled = adapter is not None
+        if enabled and self.storage is None:
+            from sglang.srt.mem_cache.unified_cache.control_storage import (
+                StorageCacheTransfers,
+            )
+
+            self.storage = StorageCacheTransfers(self)
+            from sglang.srt.mem_cache.unified_cache.control_storage_reads import (
+                StorageCacheReads,
+            )
+
+            self.storage_reads = StorageCacheReads(self)
+        elif not enabled and self.storage is not None:
+            if (
+                self.storage.jobs
+                or self.storage.interests
+                or self.storage_reads.jobs
+                or self.storage_reads.interests
+                or self.storage_reads.demands
+            ):
+                raise ControlError(
+                    "busy", "Storage control must drain before detaching"
+                )
+            self.storage = None
+            self.storage_reads = None
+
+    def _transfer_unsupported_reason(self):
         if self.core.component_types != (ComponentType.FULL,):
-            return "Host control requires the built-in FULL component"
+            return "Host control transfers require the built-in FULL component"
         if (
             getattr(self.cache, "buffer_pipeline", None) is not None
             or self.cache.sidecar_pool_specs
         ):
-            return "Buffer/draft/sidecar layouts are unsupported"
+            return "Buffer/draft/sidecar transfers are not integrated"
         return ""
 
     def _check(self, target):
@@ -133,7 +229,7 @@ class UnifiedCacheExecutor:
             raise ControlError("incompatible_namespace", "Cache namespace differs")
         reason = self.cache._kv_control_unsupported_reason
         if self.core.enable_hicache:
-            reason = reason or self._host_unsupported_reason()
+            reason = reason or self._transfer_unsupported_reason()
         if reason or self.core.enable_external_cache_linker:
             raise ControlError(
                 "unsupported",
@@ -141,9 +237,10 @@ class UnifiedCacheExecutor:
             )
 
     def capabilities(self):
+        self._refresh_storage_adapter()
         reason = self.cache._kv_control_unsupported_reason
         if self.core.enable_hicache:
-            reason = reason or self._host_unsupported_reason()
+            reason = reason or self._transfer_unsupported_reason()
         if self.control_state.generation != self.generation:
             reason = "Cache generation changed; construct a new epoch-bound executor"
         supported = not reason and not self.core.enable_external_cache_linker
@@ -164,13 +261,35 @@ class UnifiedCacheExecutor:
             "cache_generation": self.generation,
             "tree_core": "python",
             "layout_id": self.layout_id,
-            "actions": (),
+            "actions": ("sglang.prefetch", "sglang.demote")
+            if supported and self.host_control
+            else (),
             "components": tuple(ct.name.lower() for ct in self.core.component_types)
             if supported
             else (),
             "tier": "gpu",
             "directions": (
                 {
+                    "prefetch": self.storage_adapter.prefetch_paths
+                    if self.storage_adapter
+                    else (),
+                    "demote": self.storage_adapter.demote_paths
+                    if self.storage_adapter
+                    else (),
+                    "storage_backend": self.storage_adapter.backend
+                    if self.storage_adapter
+                    else None,
+                    "backend_namespace": self.storage_adapter.backend_namespace
+                    if self.storage_adapter
+                    else None,
+                    "storage_targets": self.storage_adapter is not None,
+                    "storage_profile": self.storage_adapter.profile
+                    if self.storage_adapter
+                    else None,
+                    "storage_adapter_reason": self.storage_reason,
+                    "storage_scope": "single_complete_token_prefix"
+                    if self.storage is not None
+                    else None,
                     "granularity": "whole_token_prefix_at_existing_radix_boundary",
                     "page_alignment": self.core.page_size,
                     "max_scope_pages": self.config.max_query_nodes,
@@ -180,6 +299,78 @@ class UnifiedCacheExecutor:
             ),
             "reason": reason or ("" if supported else "Linker is unsupported"),
         }
+
+    def storage_targets(self, target, location):
+        """Trusted owner query: key descriptions, without a network existence check."""
+        from sglang.srt.managers.kv_control.contracts import (
+            Prefetch,
+            PublicLocation,
+            validate_public,
+            validate_target,
+        )
+        from sglang.srt.managers.kv_control.public import normalize_public
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        validate_target(target)
+        validate_public(
+            Prefetch(
+                target=target, source=location, destination=PublicLocation(tier="host")
+            )
+        )
+        self._refresh_storage_adapter()
+        if self.storage_adapter is None:
+            raise ControlError("unsupported", self.storage_reason)
+        payload = normalize_public(
+            Prefetch(
+                target=target, source=location, destination=PublicLocation(tier="host")
+            ),
+            self.capabilities(),
+        )
+        service = self.cache.kv_control_service
+        scope = resolve_prefix(
+            payload.target,
+            service.control.context("storage_targets"),
+            service.config.limits,
+        )
+        self._check(scope)
+        # The shared path validator checks complete-prefix geometry and budgets;
+        # no operation, claim or transfer interest is created by this query.
+        projection = _StorageScope(
+            payload=payload,
+            target=scope,
+            max_result_targets=self.config.max_result_targets,
+        )
+        tokens, compatibility = self.storage_reads._scope(projection)
+        hashes = get_storage_hash_str(
+            RadixKey(
+                array("q", tokens),
+                extra_key=compatibility.extra_key,
+                cache_salt=compatibility.cache_salt,
+            ),
+            page_size=self.core.page_size,
+        )
+        pages = self.storage_adapter.describe_pages(hashes)
+        return dict(
+            description_version="1.0",
+            namespace=scope.namespace,
+            compatibility=cache_compatibility(scope.content),
+            key_salt_encoding="sglang.kv.weight.v1"
+            if service.namespace_keys
+            else "owner_assertion",
+            page_size=self.core.page_size,
+            location=self.storage_adapter.location(),
+            existence="unknown",
+            pages=tuple(
+                dict(
+                    start_token=i * self.core.page_size,
+                    end_token=(i + 1) * self.core.page_size,
+                    component="full",
+                    storage_digest=h,
+                    **page,
+                )
+                for i, (h, page) in enumerate(zip(hashes, pages))
+            ),
+        )
 
     def _compatibility(self, content):
         compatibility = cache_compatibility(content)
@@ -405,6 +596,68 @@ class UnifiedCacheExecutor:
         if self.protection is None:
             raise ControlError("unsupported", "L2 protection is not installed")
         return self.protection.start(ref=ref, payload=payload, scope=scope)
+
+    def start(self, work: ExecutionRequest) -> ExecutionUpdate:
+        try:
+            self._refresh_storage_adapter()
+            payload = work.payload
+            for location in (payload.source, payload.destination):
+                if location.backend_namespace is not None and (
+                    location.tier != "storage"
+                    or self.storage_adapter is None
+                    or location.backend_namespace
+                    != self.storage_adapter.backend_namespace
+                ):
+                    raise ControlError(
+                        "incompatible_namespace", "Storage backend namespace differs"
+                    )
+            if (
+                work.ref.context.engine_id != self.engine_id
+                or work.ref.context.engine_epoch != self.engine_epoch
+            ):
+                raise ControlError("stale_epoch", "Executor owner identity differs")
+            if not self.host_control:
+                raise ControlError("unsupported", "Cache movement requires HiCache")
+            if payload.destination.tier == "storage" and self.storage is not None:
+                return self.storage.start(work)
+            if payload.source.tier == "storage" and self.storage_reads is not None:
+                return self.storage_reads.start(work)
+            raise ControlError("unsupported", "Only L2 to/from storage is supported")
+        except ControlError as error:
+            status = {
+                "unsupported": Status.UNSUPPORTED,
+                "missing": Status.MISSING,
+                "unavailable": Status.DEFERRED,
+            }.get(error.code, Status.REJECTED)
+            return ExecutionUpdate(
+                status=status, quiescent=True, code=error.code, reason=str(error)
+            )
+
+    def poll(self, ref):
+        if (
+            self.storage_reads is not None
+            and ref.operation_id in self.storage_reads.interests
+        ):
+            return self.storage_reads.poll(ref)
+        if self.storage is not None and ref.operation_id in self.storage.interests:
+            return self.storage.poll(ref)
+        return None
+
+    def begin_poll(self, *, limit=64):
+        if self.storage is not None:
+            self.storage.begin_poll(limit=limit)
+        if self.storage_reads is not None:
+            self.storage_reads.begin_poll(limit=limit)
+
+    def cancel(self, ref):
+        if (
+            self.storage_reads is not None
+            and ref.operation_id in self.storage_reads.interests
+        ):
+            return self.storage_reads.cancel(ref)
+        if self.storage is not None and ref.operation_id in self.storage.interests:
+            return self.storage.cancel(ref)
+        return ExecutionUpdate(status=Status.CANCELLED, quiescent=True)
 
     def residency(
         self,

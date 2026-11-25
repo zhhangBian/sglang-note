@@ -120,9 +120,10 @@ class ServingCompletionTestCase(unittest.TestCase):
                 ):
                     for name, version, native in (
                         ("sglang.pin", "1.0", True),
-                        ("sglang.demote", "1.0", False),
-                        ("sglang.prefetch", "1.0", False),
+                        ("sglang.demote", "1.0", True),
+                        ("sglang.prefetch", "1.0", True),
                         ("sglang.pin", "2.0", False),
+                        ("sglang.prefetch", "2.0", False),
                         ("sglang.other", "1.0", False),
                         ("backend.hint", "1.0", False),
                     ):

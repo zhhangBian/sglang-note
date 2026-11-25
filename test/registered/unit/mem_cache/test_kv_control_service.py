@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import pytest
 import test_kv_control_cache as cache_fixtures
 
@@ -68,6 +69,49 @@ insert, match_len, target = (
 
 
 class TestKVControlService(cache_fixtures.KVCacheTestCase):
+    def test_owner_watermark_orders_real_ready_remove_and_scoped_reconciliation(self):
+        import test_kv_control_transfers as transfer_fixtures
+        from sglang.srt.managers.kv_control.contracts import Status
+
+        with transfer_fixtures.hicache(self, storage=True) as owner:
+            _, cache, service, dma = owner
+            self.assertFalse(cache.tree_core.kv_events.enabled)
+            before = service.cache_watermark()
+            node = transfer_fixtures.seed(cache)
+            self.assertGreater(service.cache_watermark().version, before.version)
+            transfer_fixtures.persist_prefix(cache, service, dma, node)
+            self.assertEqual(cache.evict_host(4), 4)
+            result = transfer_fixtures.transfer(service)
+            complete = transfer_fixtures.wait(service, result)
+            node = transfer_fixtures.prefix_path(cache, service)[-1][0]
+            self.assertEqual(complete.status, Status.COMPLETED)
+            ready = complete.cache_watermark
+            self.assertEqual(ready, service.cache_watermark())
+            self.assertEqual(cache.evict_host(100), 4)
+            self.assertIsNone(
+                node.component_data[cache_fixtures.ComponentType.FULL].host_value
+            )
+            self.assertGreater(service.cache_watermark().version, ready.version)
+            scoped = dispatch(
+                service,
+                {
+                    "kind": "residency",
+                    "context": msgspec.to_builtins(service.control.context("A")),
+                    "target": msgspec.json.decode(
+                        msgspec.json.encode(cache_fixtures.target())
+                    ),
+                    "location": {"tier": "host"},
+                },
+            )["data"]
+            self.assertFalse(scoped["items"])
+            self.assertTrue(scoped["missing"])
+            self.assertEqual(scoped["coverage_semantics"], "requested_scope_only")
+            self.assertGreater(scoped["cache_watermark"]["version"], ready.version)
+            # The historical result is unchanged even when its replica is gone.
+            self.assertEqual(service.control.registry.get(result.ref), complete)
+            self.assertEqual(cache.take_events(), [])
+            cache.sanity_check()
+
     def test_cache_reset_advances_generation_and_fences_old_control_context(self):
         with service_owner(self) as (cache, service):
             before = service.cache_watermark()
