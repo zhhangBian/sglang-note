@@ -1679,9 +1679,10 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
-        return all(
-            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        receipts = self.storage_backend.batch_set_v1(
+            hash_values, host_indices, extra_info
         )
+        return len(receipts) == len(hash_values) and all(receipts)
 
     # Backup batch by batch
     def _page_backup(self, operation):

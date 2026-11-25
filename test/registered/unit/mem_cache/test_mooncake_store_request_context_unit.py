@@ -14,6 +14,7 @@ Usage:
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
@@ -416,6 +417,86 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         self.assertEqual(set_binding.event_log[0][1]["request_id"], "s-9")
         self.assertEqual(set_binding.event_log[0][1]["caller_id"], "sglang-tp0")
         self.assertEqual(set_binding.event_log[0][1]["caller_role"], "backup")
+
+    def test_multibuffer_get_checks_all_bytes_and_put_requires_every_receipt(self):
+        from unittest.mock import patch
+
+        binding = _SupportedBinding(exist=0)
+        store = _make_mooncake_store(binding)
+        keys = ["a", "b"]
+        pool = SimpleNamespace(
+            page_size=1,
+            kv_buffer=True,
+            get_page_buffer_meta=lambda indices: ([10, 20, 30, 40], [4, 8, 4, 8]),
+        )
+        store.is_mla_backend = True
+        store.mla_suffix = "mla"
+        store._replicate_config_cls = SimpleNamespace
+        store.mem_pool_host = pool
+        store.dcp_size = 1
+        store.registered_pools = {PoolName.KV: pool}
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (list(keys), 1)
+        transfer = PoolTransfer(name=PoolName.KV, host_indices=[0, 1], keys=keys)
+        for receipt, expected in (
+            ([12, 12], [True, True]),
+            ([11, 13], [False, False]),
+            ([12], [True, False]),
+        ):
+            with patch.object(
+                binding, "batch_get_into_multi_buffers", return_value=receipt
+            ):
+                self.assertEqual(store.batch_get_v1(keys, [0, 1]), expected)
+                self.assertEqual(store.batch_get_v2([transfer])[PoolName.KV], expected)
+        with patch.object(binding, "batch_put_from_multi_buffers", return_value=[0]):
+            self.assertEqual(store.batch_set_v1(keys, [0, 1]), [True, False])
+            self.assertEqual(store.batch_set_v2([transfer])[PoolName.KV], [True, False])
+
+        with patch.object(binding, "batch_is_exist", return_value=[1]):
+            self.assertEqual(store.batch_set_v1(keys, [0, 1]), [False, False])
+            self.assertEqual(
+                store.batch_set_v2([transfer])[PoolName.KV], [False, False]
+            )
+
+    def test_mooncake_short_object_read_and_write_receipts_are_not_complete_pages(self):
+        from unittest.mock import patch
+
+        binding = _SupportedBinding(exist=0)
+        store = _make_mooncake_store(binding)
+        store.config_prefix = "test"
+        store.mha_suffix = "0"
+        store.dcp_size = 1
+        store.mem_pool_host = SimpleNamespace(
+            page_size=1,
+            kv_buffer=True,
+            get_page_buffer_meta=lambda indices: ([10, 20], [4, 8]),
+        )
+        hashes = ["digest"]
+        indices = [0]
+        keys, _, sizes = store._batch_preprocess(store._tag_keys(hashes), indices)
+        self.assertEqual(keys, ["test_digest_0_k", "test_digest_0_v"])
+
+        for receipt, expected in (
+            (sizes, [True]),
+            ([sizes[0], sizes[1] - 1], [False]),
+            ([sizes[0]], [False]),
+            ([], [False]),
+        ):
+            with patch.object(binding, "batch_get_into", return_value=receipt):
+                self.assertEqual(store.batch_get_v1(hashes, indices), expected)
+
+        with patch.object(binding, "batch_put_from", return_value=[0]):
+            self.assertEqual(store.batch_set_v1(hashes, indices), [False])
+        with (
+            patch.object(binding, "batch_is_exist", return_value=[1, 1]),
+            patch.object(binding, "batch_put_from") as put,
+        ):
+            self.assertEqual(store.batch_set_v1(hashes, indices), [True])
+            put.assert_not_called()
+
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.storage_backend = store
+        with patch.object(store, "batch_set_v1", return_value=[]):
+            self.assertFalse(controller._page_set_zero_copy(hashes, indices))
 
     def test_batch_exists_v2_wraps_sidecar_exist(self):
         binding = _SupportedBinding(exist=1)
