@@ -67,9 +67,7 @@ def non_native_slots(tree_slots) -> list:
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.kv_control_config is not None:
-        return (
-            "programmable copy priorities require the Python TreeCore lifecycle hooks"
-        )
+        return "KV cache priority control requires the Python TreeCore lifecycle hooks"
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_slots is not None and several_window_slots(params.tree_slots):
@@ -140,7 +138,7 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     """
     if params.kv_control_config is not None and name not in ("python", "rust"):
         raise ValueError(
-            "programmable copy priorities are unsupported by this TreeCore backend"
+            "KV cache priority control is unsupported by this TreeCore backend"
         )
     if name != "rust":
         return name

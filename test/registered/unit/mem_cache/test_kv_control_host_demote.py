@@ -12,6 +12,7 @@ from test_kv_control_transfers import (
     backup_prefix,
     current,
     hicache,
+    mooncake_store,
     persist_prefix,
     public_transfer,
     seed,
@@ -345,6 +346,74 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertFalse(done.public_result.reclaimed_scope)
             self.assertEqual(pool.available_size(), initial)
             self.assertIsNotNone(node.component_data[FULL].host_value)
+            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
+            cache.sanity_check()
+
+    def test_short_preexisting_mooncake_object_blocks_host_reclamation(self):
+        from types import SimpleNamespace
+
+        with hicache(self, storage=True) as owner:
+            _, cache, service, dma = owner
+            node = seed(cache)
+            backup_prefix(cache, dma, node, evict=True)
+            cc = cache.cache_controller
+            store = mooncake_store(cache)
+            pool = store.mem_pool_host
+            initial = pool.available_size()
+            hashes = cache.tree_core.get_hash_values(node.id)
+            objects, _, sizes = store._batch_preprocess(
+                store._tag_keys(hashes), node.component_data[FULL].host_value
+            )
+            complete_sizes = dict(zip(objects, sizes, strict=True))
+            complete_sizes[objects[-1]] -= 1
+            store.store = SimpleNamespace(
+                batch_is_exist=lambda keys: [int(k in complete_sizes) for k in keys],
+                get_size=complete_sizes.__getitem__,
+            )
+            store.config = SimpleNamespace(
+                master_server_address="test", metadata_server="test", tenant_id="test"
+            )
+            with (
+                patch.object(cc, "storage_backend", store),
+                patch.object(cc, "storage_backend_type", "mooncake"),
+                patch.object(cc, "page_set_func", cc._page_set_zero_copy),
+                patch.object(pool, "layout", "page_first_direct"),
+            ):
+                result = public_transfer(
+                    service, "demote", "host", "storage", "truncated"
+                )
+                done = wait(service, result)
+            self.assertEqual(done.update.code, "incomplete_storage_write")
+            self.assertEqual(ranges(done.public_result.preserved_scope), [(0, 3)])
+            self.assertFalse(done.public_result.reclaimed_scope)
+            self.assertEqual(pool.available_size(), initial)
+            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
+            cache.sanity_check()
+
+    def test_storage_clear_after_worker_verification_fences_host_reclamation(self):
+        with hicache(self, storage=True) as owner:
+            _, cache, service, dma = owner
+            node = seed(cache)
+            backup_prefix(cache, dma, node, evict=True)
+            pool = cache.host_pool_group.anchor_entry.host_pool
+            initial = pool.available_size()
+            result = public_transfer(service, "demote", "host", "storage", "clear")
+            # The worker has certified the objects. Hold its ACK off the owner
+            # queue until the clear has invalidated that verification.
+            queue = cache.cache_controller.ack_backup_queue
+            ack = queue.get(timeout=5)
+            self.assertEqual(ack.completed_tokens, 4)
+            try:
+                self.assertTrue(cache.clear_storage_backend())
+            finally:
+                queue.put(ack)
+            done = wait(service, result)
+            self.assertEqual(done.update.code, "storage_cleared")
+            self.assertEqual(ranges(done.public_result.blocked_scope), [(0, 4)])
+            self.assertFalse(done.public_result.reclaimed_scope)
+            self.assertFalse(done.public_result.preserved_scope)
+            self.assertIsNotNone(node.component_data[FULL].host_value)
+            self.assertEqual(pool.available_size(), initial)
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 

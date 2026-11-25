@@ -19,7 +19,12 @@ from sglang.srt.managers.kv_control.contracts import (
     TargetOutcome,
     TokenRange,
 )
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, DecLockRefParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    DecLockRefParams,
+    MatchPrefixParams,
+)
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 FULL = ComponentType.FULL
@@ -86,7 +91,7 @@ class StorageCacheReads:
     """Shared one-prefix restores with complete-scope approval and real fences.
 
     Cold host scopes pipeline across independent radix branches with bounded
-    admission. Reads sharing a radix root page serialize until publication.
+    admission. Reads targeting a common cold page serialize until publication.
     Compatible readers share one interest-independent physical job.
     """
 
@@ -265,17 +270,27 @@ class StorageCacheReads:
                 self._joinable[key] = job
         if job is None or job.cancel_requested or job.failure or job.retired:
             return False
+        try:
+            host_length = self._host_length(job)
+        except ControlError:
+            # A control walk budget must not prevent ordinary admission.
+            return False
         if job.operation is None:
             if not self._has_live_interest(job):
                 return False
             if (
-                self._admission_wait(job) == "storage_concurrency_limit"
+                self._admission_wait(job, host_length) is not None
                 or self.cache.cache_controller.prefetch_rate_limited()
             ):
                 # The speculative queue has not issued I/O for this scope.
                 # Preserve ordinary admission (including the rate-limit
                 # fallback) and retire the hint so it cannot issue a late GET.
-                self._retire(job, status=Status.DEFERRED, code="ordinary_restore")
+                self._retire(
+                    job,
+                    status=Status.DEFERRED,
+                    code="ordinary_restore",
+                    host_length=host_length,
+                )
                 return False
         resume_tokens = None
         if len(job.tokens) < demand_length:
@@ -283,7 +298,7 @@ class StorageCacheReads:
             if truncated:
                 resume_tokens += tuple(suffix_ids[lookup_suffix_length:])
         self.demands[request] = _Demand(
-            job, max(prefix_length, self._host_length(job)), resume_tokens=resume_tokens
+            job, max(prefix_length, host_length), resume_tokens=resume_tokens
         )
         job.demands.add(request)
         self.stats["demand_coalesced"] += 1
@@ -296,6 +311,14 @@ class StorageCacheReads:
         demand = self.demands.get(request)
         return None if demand is None else demand.job.retired
 
+    def _match_ordinary_prefix(self, tokens, compatibility):
+        key = RadixKey(
+            array("q", tokens),
+            extra_key=compatibility.extra_key,
+            cache_salt=compatibility.cache_salt,
+        )
+        return self.cache.match_prefix(MatchPrefixParams(key=key))
+
     def check_demand_progress(self, request):
         demand = self.demands.get(request)
         if demand is None:
@@ -307,21 +330,34 @@ class StorageCacheReads:
         if not demand.tail_started:
             demand.tail_started = True
             tokens, compatibility = demand.resume_tokens, demand.job.compatibility
-            anchor, length = self.cache.tree_core.root_node, 0
-            for node, _, end, matched in self.executor._walk(tokens, compatibility):
-                if not self._host_ready(node):
-                    break
-                if matched == len(tokens):
+            anchor, length = self.cache.tree_core.root_node.id, 0
+            try:
+                path = self.executor._walk(tokens, compatibility)
+            except ControlError:
+                # A shared ancestor is budgeted control work. Its demand tail
+                # can span arbitrarily many materialized radix nodes.
+                match = self._match_ordinary_prefix(tokens, compatibility)
+                anchor = match.last_host_node
+                length = match.device_prefix_len + match.host_hit_length
+                if length == len(tokens) or not (
+                    self.cache.is_root(anchor) or self.cache.is_backuped(anchor)
+                ):
                     return None
-                if matched != end:
-                    break
-                anchor, length = node, end
+            else:
+                for node, _, end, matched in path:
+                    if not self._host_ready(node):
+                        break
+                    if matched == len(tokens):
+                        return None
+                    if matched != end:
+                        break
+                    anchor, length = node.id, end
             self.cache.prefetch_from_storage(
                 request,
-                anchor.id,
+                anchor,
                 array("q", tokens[length:]),
-                last_hash=self.cache.get_last_hash_value(anchor.id),
-                prefix_keys=self.cache.get_prefix_hash_values(anchor.id)
+                last_hash=self.cache.get_last_hash_value(anchor),
+                prefix_keys=self.cache.get_prefix_hash_values(anchor)
                 if self.cache.hicache_storage_pass_prefix_keys
                 else None,
                 matched_prefix_tokens=list(tokens[:length]),
@@ -559,14 +595,7 @@ class StorageCacheReads:
             if host_length == len(job.tokens):
                 self._retire(job, host_length=host_length)
                 return
-            if rows:
-                node, start, end = rows[-1]
-                if end - start < len(node.key):
-                    # A matched slice of a compressed sibling is readable,
-                    # but only a full node can anchor a storage suffix.
-                    rows.pop()
-                    host_length = min(host_length, start)
-            waiting = self._admission_wait(job)
+            waiting = self._admission_wait(job, host_length)
             if waiting is not None:
                 job.waiting = waiting
                 return
@@ -575,20 +604,29 @@ class StorageCacheReads:
                 return
             needed = len(job.tokens) - host_length
             job.requested_tokens = needed
-            anchor = next(
-                (n for n, _, end in rows if end == host_length),
-                self.cache.tree_core.root_node,
-            )
+            anchor = self.cache.tree_core.root_node.id
+            for node, start, end in rows:
+                if end == host_length:
+                    anchor = node.id
+                    if end - start < len(node.key):
+                        # Materialize the resident branch point. The shared
+                        # portion of a compressed sibling needs no storage I/O.
+                        match = self._match_ordinary_prefix(
+                            job.tokens[:end], job.compatibility
+                        )
+                        anchor = match.last_host_node
+                    break
             self.cache.prefetch_from_storage(
                 job.handle,
-                anchor.id,
+                anchor,
                 array("q", job.tokens[host_length:]),
-                last_hash=self.cache.get_last_hash_value(anchor.id),
-                prefix_keys=self.cache.get_prefix_hash_values(anchor.id)
-                + self.cache.tree_core.get_hash_values(anchor.id)
+                last_hash=self.cache.get_last_hash_value(anchor),
+                prefix_keys=self.cache.get_prefix_hash_values(anchor)
+                + self.cache.tree_core.get_hash_values(anchor)
                 if self.cache.hicache_storage_pass_prefix_keys
                 else None,
                 matched_prefix_tokens=list(job.tokens[:host_length]),
+                extra_key=job.compatibility.extra_key,
                 cache_salt=job.compatibility.cache_salt,
                 minimum_prefetch_tokens=self.cache.page_size,
             )
@@ -611,7 +649,7 @@ class StorageCacheReads:
             if job.operation is None:
                 self._retire(job)
 
-    def _admission_wait(self, job):
+    def _admission_wait(self, job, storage_start):
         active = [
             other
             for other in self.jobs.values()
@@ -620,14 +658,20 @@ class StorageCacheReads:
         if len(active) >= self.executor.config.max_concurrent_storage_reads:
             return "storage_concurrency_limit"
         page_size = self.cache.page_size
-        root_page = job.tokens[:page_size]
-        if any(
-            job.compatibility.cache_salt == other.compatibility.cache_salt
-            and job.compatibility.extra_key == other.compatibility.extra_key
-            and root_page == other.tokens[:page_size]
-            for other in active
-        ):
-            return "shared_prefix_serialization"
+        for other in active:
+            if (job.compatibility.extra_key, job.compatibility.cache_salt) != (
+                other.compatibility.extra_key,
+                other.compatibility.cache_salt,
+            ):
+                continue
+            # Page identity includes its entire prefix. The first page in the
+            # intersection determines whether the two GET ranges can overlap.
+            end = max(storage_start, other.operation.storage_start) + page_size
+            if (
+                end <= min(len(job.tokens), len(other.tokens))
+                and job.tokens[:end] == other.tokens[:end]
+            ):
+                return "shared_prefix_serialization"
         return None
 
     def _has_live_interest(self, job):

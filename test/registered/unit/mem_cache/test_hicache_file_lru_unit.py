@@ -563,6 +563,25 @@ def _dcp_config(rank=0, tp=4, dcp=2, **overrides):
     return replace(cfg, **overrides)
 
 
+class TestPrefetchBuffer(unittest.TestCase):
+    def test_dequeue_does_not_probe_live_reads_for_cancellation(self):
+        from sglang.srt.managers.cache_controller import (
+            PrefetchOperation,
+            _PrefetchBuffer,
+        )
+
+        queue = _PrefetchBuffer()
+        reads = [PrefetchOperation(str(i), [i]) for i in range(64)]
+        for operation in reads:
+            queue.put(operation)
+        reads[-1].mark_terminate()
+        with mock.patch.object(
+            PrefetchOperation, "is_terminated", side_effect=AssertionError("queue scan")
+        ):
+            self.assertIs(queue.get_nowait(), reads[-1])
+            self.assertEqual([queue.get_nowait() for _ in reads[:-1]], reads[:-1])
+
+
 class TestDcpStorage(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()

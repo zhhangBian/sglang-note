@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Real GPU/host/storage KV round trips and resource reclamation."""
+"""KV cache priority control and storage transfers with real GPU and host pools."""
 
 import atexit
 import json

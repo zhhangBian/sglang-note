@@ -403,6 +403,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # returned once the copy has finished.
         self._pending_restore_backups: list[tuple[object, RetractionBackup]] = []
         # Owns the storage backend lifecycle; built by init_hicache.
+        self._storage_clear_generation = 0
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
         self.prefetch_stop_policy = "best_effort"
@@ -1680,10 +1681,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.token_to_kv_pool_allocator.state.release(self.req_to_token_pool, req)
 
     @rank_consensus(same_params=["req.rid", "up_to"])
-    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> Optional[int]:
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
-            return
-        self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            return None
+        return self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
     def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
         mamba = self.components.get(ComponentType.MAMBA)
@@ -1700,15 +1701,15 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         )
 
-    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
-        """Insert ``[cache_protected_len, up_to)`` of the request's record and
-        move its tree lock onto the node the insert ended on."""
+    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> int:
+        """Insert the eligible prefix, move the tree lock, and return its length."""
         is_finished = req.finished()
-        self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        inserted = self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
         if is_finished:
             self._release_request_mamba(req)
+        return inserted
 
-    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def _checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> int:
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -1718,7 +1719,7 @@ class UnifiedRadixCache(BasePrefixCache):
             if is_finished:
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
-            return
+            return 0
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -1770,7 +1771,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
                 )
-            return
+            return 0
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
@@ -1810,7 +1811,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
                 )
-            return
+            return 0
         req.kv.record_insert(page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output
@@ -1902,7 +1903,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and effective_cache_len < len(token_ids)
             and up_to >= len(req.origin_input_ids)
         ):
-            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            return self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+        return page_aligned_len
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -2985,7 +2987,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if minimum_prefetch_tokens is not None:
             operation.native_prefetch_threshold = threshold
         elif (
-            native_reads is not None and not buffer_mode and not prefetch_key.is_bigram
+            native_reads is not None
+            and not buffer_mode
+            and not prefetch_key.is_bigram
+            and not self.forwards_kv_hint_actions(kv_hints)
         ):
             # Keep the already sliced request prefix for late control hints.
             # Ordinary submission/allocation is otherwise unchanged.
@@ -3703,6 +3708,9 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
         )
 
+    # Handle-based HiCache callers may release an aborted attempt directly.
+    release_aborted_request = _abandon_attempt
+
     def _retire_ongoing_prefetch(
         self,
         request: CacheRequestHandle,
@@ -3954,10 +3962,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
         buffer_mode = self.host_memory_mode == "buffer_only"
         defer_read_staging = (
-            not buffer_mode
-            and self._native_storage_reads() is not None
-            and len(self.tree_components) == 1
-            and BASE_COMPONENT_TYPE in self.tree_components
+            self.host_memory_mode == "cache"
+            and self.tree_core.component_types == (BASE_COMPONENT_TYPE,)
             and not cc.prefetch_completion_sync_groups
         )
 
@@ -4187,7 +4193,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             # Preserve order within each class and leave already-staged reads
             # alone. A hint with a joined request counts as demand.
-            if len(local_hits) > 1:
+            if len(local_hits) > 1 and self._native_storage_reads() is not None:
                 local_hits.sort(key=_is_speculative)
             io_busy = False
             for operation in local_hits:
@@ -4498,6 +4504,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._storage_attachment.shutdown()
 
     def clear_storage_backend(self) -> bool:
+        # A failed clear can still remove some objects. Invalidate pending moves.
+        self._storage_clear_generation += 1
         if self._storage_attachment is None:
             return False
         ok = self._storage_attachment.clear()

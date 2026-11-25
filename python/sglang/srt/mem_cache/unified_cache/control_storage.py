@@ -27,6 +27,7 @@ class _Write:
     key: bytes
     tokens: tuple[int, ...]
     compatibility: object
+    storage_generation: int
     interests: set[str] = field(default_factory=set)
     host_locks: list = field(default_factory=list)
     operation_id: int | None = None
@@ -82,7 +83,9 @@ class StorageCacheTransfers:
         key = hashlib.sha256(msgspec.json.encode((tokens, compatibility))).digest()
         job = self.jobs.get(key)
         if job is None:
-            job = _Write(key, tokens, compatibility)
+            job = _Write(
+                key, tokens, compatibility, self.cache._storage_clear_generation
+            )
             self.jobs[key] = job
         identity = work.ref.operation_id
         interest = _Interest(work, job)
@@ -289,6 +292,13 @@ class StorageCacheTransfers:
         rows = self._rows(job) if job.operation_id is not None else ()
         self.executor._release_host(job.host_locks)
         active = any(not self.interests[i].cancelled for i in job.interests)
+        if rows and not self.cache.kv_control_service.all_shards_ready(
+            job.storage_generation == self.cache._storage_clear_generation
+        ):
+            job.completed = 0
+            job.failure = ("storage_cleared", "Storage was cleared during DEMOTE")
+            job.failure_status = Status.DEFERRED
+            rows = ()  # Report the whole requested scope as blocked.
         if rows and job.failure is None and active:
             self._reclaim_host(job, rows)
         try:

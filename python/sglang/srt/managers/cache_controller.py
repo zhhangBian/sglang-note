@@ -17,7 +17,9 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from functools import cached_property
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
@@ -293,7 +295,31 @@ HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 STORAGE_STOP_JOIN_S = 60.0
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchCancellation:
+    """Shared termination state for ordinary and hybrid storage readers."""
+
+    _prefetch_buffer = None
+
+    def __init__(self, *args, **kwargs):
+        self._lock = threading.Lock()
+        self._terminated_flag = False
+        super().__init__(*args, **kwargs)
+
+    def mark_terminate(self):
+        with self._lock:
+            self._terminated_flag = True
+        # The queue checks the flag on insertion. Notify it for cancellation
+        # after insertion, without holding the operation lock across its mutex.
+        buffer = self._prefetch_buffer
+        if buffer is not None:
+            buffer.prioritize_cancelled(self)
+
+    def is_terminated(self) -> bool:
+        with self._lock:
+            return self._terminated_flag
+
+
+class PrefetchOperation(PrefetchCancellation, StorageOperation):
     def __init__(
         self,
         request_id: str,
@@ -303,33 +329,35 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
-        self._lock = threading.Lock()
-        self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
-    def mark_terminate(self):
-        with self._lock:
-            self._terminated_flag = True
-
-    def is_terminated(self) -> bool:
-        with self._lock:
-            return self._terminated_flag
-
 
 class _PrefetchBuffer(Queue):
     """Drain cancelled reads before live I/O for a single storage participant."""
 
+    def _init(self, maxsize):
+        self.queue = OrderedDict()
+
+    def _put(self, operation):
+        self.queue[operation] = None
+        if operation is not None:
+            operation._prefetch_buffer = self
+            if operation.is_terminated():
+                self.queue.move_to_end(operation, last=False)
+
+    def prioritize_cancelled(self, operation):
+        with self.mutex:
+            if operation in self.queue:
+                self.queue.move_to_end(operation, last=False)
+
     def _get(self):
-        for index, operation in enumerate(self.queue):
-            if operation is not None and operation.is_terminated():
-                self.queue.rotate(-index)
-                cancelled = self.queue.popleft()
-                self.queue.rotate(index)
-                return cancelled
-        return super()._get()
+        operation, _ = self.queue.popitem(last=False)
+        if operation is not None:
+            operation._prefetch_buffer = None
+        return operation
 
 
 def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
@@ -428,16 +456,6 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
-        # Query and GET each have a single writer thread and separate keys.
-        # Samples are cumulative local observations, not a TP-reduced snapshot.
-        self.storage_read_stats = dict(
-            query_jobs=0,
-            query_seconds=0.0,
-            get_batches=0,
-            get_requested_tokens=0,
-            get_completed_tokens=0,
-            get_seconds=0.0,
-        )
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -583,6 +601,8 @@ class HiCacheController:
     def _start_storage_worker_threads(self) -> None:
         """Create and start the four storage workers; their queues must exist.
         The IO worker starts before the sync thread, which reads its handle."""
+        # Create the shared counters before either worker can update them.
+        _ = self.storage_read_stats
         self._storage_worker_failures = {}
         self.prefetch_thread = self._start_storage_worker(
             "hicache-prefetch", self.prefetch_thread_func
@@ -1362,6 +1382,19 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
+    @cached_property
+    def storage_read_stats(self):
+        # Query and GET each have a single writer thread and separate keys.
+        # Samples are cumulative local observations, not a TP-reduced snapshot.
+        return dict(
+            query_jobs=0,
+            query_seconds=0.0,
+            get_batches=0,
+            get_requested_tokens=0,
+            get_completed_tokens=0,
+            get_seconds=0.0,
+        )
+
     def storage_read_stats_snapshot(self):
         """All ordinary/native reads; bytes describe anchor KV API payload only.
 
@@ -1739,9 +1772,10 @@ class HiCacheController:
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
-        return all(
-            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+        receipts = self.storage_backend.batch_set_v1(
+            hash_values, host_indices, extra_info
         )
+        return len(receipts) == len(hash_values) and all(receipts)
 
     # Backup batch by batch
     def _page_backup(self, operation):
@@ -1778,12 +1812,20 @@ class HiCacheController:
                 # worker boundary, not the sum of successful batch receipts.
                 written = operation.completed_tokens
                 operation.completed_tokens = 0
-                present = self.storage_backend.batch_exists(
-                    operation.hash_value,
-                    HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys),
-                )
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+                verify = getattr(self.storage_backend, "verify_backup_prefix", None)
+                if verify is None:
+                    present = self.storage_backend.batch_exists(
+                        operation.hash_value, extra_info
+                    )
+                else:
+                    present = verify(
+                        operation.hash_value, operation.host_indices, extra_info
+                    )
                 operation.completed_tokens = min(written, present * self.page_size)
         except Exception:
+            if getattr(operation, "verify_backup_prefix", False):
+                operation.completed_tokens = 0
             logger.exception(
                 "HiCache backup failed after %d tokens", operation.completed_tokens
             )
