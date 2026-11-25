@@ -5,6 +5,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -127,6 +128,21 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
     loaded_weights: bool = False
 
 
+def _requires_mutable_weights(response_type):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self, recv_req):
+            if getattr(self.scheduler, "kv_control_service", None) is not None:
+                return response_type(
+                    success=False, message="KV control requires fixed model weights"
+                )
+            return function(self, recv_req)
+
+        return wrapped
+
+    return decorate
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -179,6 +195,7 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    @_requires_mutable_weights(UpdateWeightFromDiskReqOutput)
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
@@ -229,6 +246,7 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    @_requires_mutable_weights(UpdateWeightsFromDistributedReqOutput)
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -284,6 +302,7 @@ class SchedulerWeightUpdaterManager:
                 break
         return success, message
 
+    @_requires_mutable_weights(UpdateWeightsFromTensorReqOutput)
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
         if self._session is None:
@@ -326,6 +345,7 @@ class SchedulerWeightUpdaterManager:
             control_request_barrier()
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
+    @_requires_mutable_weights(UpdateWeightsFromIPCReqOutput)
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
@@ -371,6 +391,7 @@ class SchedulerWeightUpdaterManager:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    @_requires_mutable_weights(BeginWeightUpdateReqOutput)
     def begin_weight_update(self, recv_req: BeginWeightUpdateReqInput):
         """Open the session: restore in-place-packed weights on the selected runners."""
         if self._session is not None:
@@ -400,6 +421,7 @@ class SchedulerWeightUpdaterManager:
         control_request_barrier()
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
+    @_requires_mutable_weights(EndWeightUpdateReqOutput)
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
         """Finalize the runners begin opened; post_load_weights only if no load ran (P2P/RDMA)."""
         if self._session is None:
@@ -509,6 +531,11 @@ class SchedulerWeightUpdaterManager:
         )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        if getattr(self.scheduler, "kv_control_service", None) is not None:
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="KV control requires resident model and cache memory",
+            )
         scheduler = self.scheduler
         idle = self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
@@ -567,6 +594,11 @@ class SchedulerWeightUpdaterManager:
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        if getattr(self.scheduler, "kv_control_service", None) is not None:
+            return ResumeMemoryOccupationReqOutput(
+                success=False,
+                message="KV control requires resident model and cache memory",
+            )
         tags = recv_req.tags
 
         if tags is None or len(tags) == 0:
@@ -607,6 +639,13 @@ class SchedulerWeightUpdaterManager:
         return ResumeMemoryOccupationReqOutput()
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
+        if (
+            recv_req.action == "reset_tensors"
+            and getattr(self.scheduler, "kv_control_service", None) is not None
+        ):
+            return CheckWeightsReqOutput(
+                success=False, message="KV control requires fixed model weights"
+            )
         try:
             role_payloads = []
             for role, runner in self._select_runners(recv_req.selector):

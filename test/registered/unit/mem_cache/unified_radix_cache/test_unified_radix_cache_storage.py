@@ -2910,6 +2910,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
     def test_hybrid_prefetch_rejects_partial_host_allocation(self):
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             HybridCacheController,
+            PrefetchOperation,
         )
 
         for component, pool in (
@@ -2936,13 +2937,12 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                     return list(range(num_tokens)) if num_tokens <= 4 else None
 
                 cc.alloc_prefetch_host_buffers.side_effect = allocate_host_buffers
-                operation = mock.Mock()
-                operation.handle = CacheRequestHandle("hybrid-capacity", 0)
+                operation = PrefetchOperation(
+                    CacheRequestHandle("hybrid-capacity", 0), list(range(8))
+                )
                 operation.storage_start = 4
                 operation.storage_hit_count = 8
                 operation.hash_value = ["h1", "h2"]
-                operation.host_indices = None
-                operation.is_terminated.return_value = False
                 cache.ongoing_prefetch = {
                     operation.handle: _OngoingPrefetch(
                         anchor_node_id=0,
@@ -2989,6 +2989,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
         cache.page_size = 1
         cache.enable_storage_metrics = False
         cache.buffer_pipeline = None  # cache-mode commit path
+        cache._native_storage_reads.return_value = None
         cache._is_pp_ticketed.return_value = False
         walk_action = object()
         insert_result = mock.MagicMock()

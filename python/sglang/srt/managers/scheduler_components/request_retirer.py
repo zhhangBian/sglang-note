@@ -177,6 +177,9 @@ class RequestRetirer:
         """Drop an aborted request from the components tracking it and free its
         media, but no KV or rows. `release` runs it before the KV goes: uOCR's
         drop tells unadmitted prefix slots from row-owned ones by `holds_kv`."""
+        service = getattr(self.tree_cache, "kv_control_service", None)
+        if service is not None:
+            service.finish_request(req, aborted=True)
         # Counted before the media goes: the output sent after still reports it.
         req.get_mm_token_counts()
         req.release_mm_inputs_on_abort()

@@ -66,6 +66,8 @@ def non_native_slots(tree_slots) -> list:
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    if params.kv_control_config is not None:
+        return "KV cache priority control requires the Python TreeCore lifecycle hooks"
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_slots is not None and several_window_slots(params.tree_slots):
@@ -134,6 +136,10 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     Explicit Rust selections use the same compatibility policy as the default.
     Build, import, and runtime failures remain errors when the toolchain is usable.
     """
+    if params.kv_control_config is not None and name not in ("python", "rust"):
+        raise ValueError(
+            "KV cache priority control is unsupported by this TreeCore backend"
+        )
     if name != "rust":
         return name
     reason = _rust_fallback_reason(params)

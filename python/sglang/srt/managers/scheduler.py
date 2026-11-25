@@ -774,6 +774,24 @@ class Scheduler(
 
         self.init_weight_updater()
 
+        self.kv_control_service = None
+        if get_memory().kv_control_config is not None:
+            from sglang.srt.managers.kv_control.service import (
+                KVControlService,
+                runtime_config,
+            )
+
+            self.kv_control_service = KVControlService(
+                self.tree_cache,
+                runtime_config(),
+                namespace_keys=True,
+                tp_group=(
+                    get_parallel().tp_group.cpu_group
+                    if get_parallel().tp_size > 1
+                    else None
+                ),
+            )
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -1998,8 +2016,11 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        from sglang.srt.managers.io_struct import KVControlReqInput
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (KVControlReqInput, self.handle_kv_control),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -2396,6 +2417,8 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.progress()
 
         for recv_req in recv_reqs:
             # Before any early exit, so every request releases its CUDA IPC pool slot.
@@ -2771,6 +2794,12 @@ class Scheduler(
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            kv_control=(
+                self.kv_control_service
+                if self.kv_control_service is not None
+                and self.kv_control_service.tp_group is not None
+                else None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -3357,8 +3386,39 @@ class Scheduler(
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
-        """Extension point for request-local state, including session requests."""
+        """Constructor extension point; preparation belongs to the caller wrapper."""
         return Req(*args, **kwargs)
+
+    def _new_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Prepare every constructed subclass, including reconstructed sessions."""
+        kwargs.setdefault("kv_hints", recv_req.kv_hints)
+        req = self._create_generation_req(recv_req, *args, **kwargs)
+        if getattr(self, "kv_control_service", None) is not None:
+            from sglang.srt.managers.kv_control.contracts import ControlError
+
+            try:
+                self.kv_control_service.prepare_request(req)
+                self.kv_control_service.attach(
+                    req,
+                    recv_req.kv_hints,
+                    unsupported_request=recv_req.mm_inputs is not None,
+                )
+            except ControlError as error:
+                req.set_finish_with_abort(
+                    f"KV control rejected: {error.code}: {error}", status_code=400
+                )
+        return req
+
+    def handle_kv_control(self, recv_req):
+        from sglang.srt.managers.io_struct import KVControlReqOutput
+        from sglang.srt.managers.kv_control.service import dispatch
+
+        return KVControlReqOutput(
+            request_id=recv_req.request_id,
+            result=dispatch(self.kv_control_service, recv_req.command),
+        )
 
     def handle_generate_request(
         self,
@@ -3402,7 +3462,7 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = self._create_generation_req(
+            req = self._new_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -3493,7 +3553,7 @@ class Scheduler(
                 self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
-                req_factory=partial(self._create_generation_req, recv_req),
+                req_factory=partial(self._new_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3515,7 +3575,7 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = self._create_generation_req(
+            req = self._new_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -4158,6 +4218,8 @@ class Scheduler(
             token_indices_to_pool=recv_req.token_indices_to_pool,
             decision_layout=recv_req.decision_layout,
         )
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.prepare_request(req)
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
@@ -4342,7 +4404,7 @@ class Scheduler(
 
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
-    ) -> None:
+    ) -> bool:
         # The HiCache drain is consensus over one DP rank's attention TP and CP
         # ranks, not TP-wide; run it before rank-local decisions
         # (_should_defer_prefill) or ranks enter different collectives.
@@ -4352,16 +4414,21 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            write_completed = self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
+            return bool(write_completed)
+        return False
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
-        self._process_hicache_events()
+        if self._process_hicache_events():
+            # A backup can unlock device KV after admission found no space,
+            # even though the decoding batch has not changed.
+            running_batch.batch_is_full = False
 
         staged = []
         if self.dllm_config is not None:
@@ -4682,7 +4749,6 @@ class Scheduler(
                 chunked_req=self.chunked_req,
             )
         )
-
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
@@ -6245,6 +6311,8 @@ class Scheduler(
         idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
+            if getattr(self, "kv_control_service", None) is not None:
+                idle &= not self.kv_control_service.has_pending
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
@@ -6405,6 +6473,8 @@ class Scheduler(
                     },
                 )
             self.tree_cache.reset()
+            if getattr(self, "kv_control_service", None) is not None:
+                self.kv_control_service.reset_after_cache_flush()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -6577,6 +6647,10 @@ class Scheduler(
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
+        if getattr(self, "kv_control_service", None) is not None:
+            return UpdateWeightVersionReqOutput(
+                success=False, message="KV control requires a fixed weight version"
+            )
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 
@@ -7035,7 +7109,14 @@ class Scheduler(
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+            service = self.kv_control_service
+            deadline = service.next_deadline if service is not None else None
+            timeout_ms = (
+                1000
+                if deadline is None
+                else max(0, min(1000, math.ceil((deadline - time.monotonic()) * 1000)))
+            )
+            self.idle_sleeper.maybe_sleep(timeout_ms=timeout_ms)
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""

@@ -417,6 +417,58 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         self.assertEqual(set_binding.event_log[0][1]["caller_id"], "sglang-tp0")
         self.assertEqual(set_binding.event_log[0][1]["caller_role"], "backup")
 
+    def test_multibuffer_get_checks_all_bytes_and_put_requires_every_receipt(self):
+        from unittest.mock import patch
+
+        binding = _SupportedBinding(exist=0)
+        store = _make_mooncake_store(binding)
+        keys = ["a", "b"]
+        pool = SimpleNamespace(
+            page_size=1,
+            kv_buffer=True,
+            get_page_buffer_meta=lambda indices: ([10, 20, 30, 40], [4, 8, 4, 8]),
+        )
+        store.is_mla_backend = True
+        store.mla_suffix = "mla"
+        store._replicate_config_cls = SimpleNamespace
+        store.mem_pool_host = pool
+        store.dcp_size = 1
+        store.registered_pools = {PoolName.KV: pool}
+        store._get_hybrid_page_component_keys = lambda keys, transfer: (list(keys), 1)
+        transfer = PoolTransfer(name=PoolName.KV, host_indices=[0, 1], keys=keys)
+        for receipt, expected in (
+            ([12, 12], [True, True]),
+            ([11, 13], [False, False]),
+            ([12], [True, False]),
+        ):
+            with patch.object(
+                binding, "batch_get_into_multi_buffers", return_value=receipt
+            ):
+                self.assertEqual(store.batch_get_v1(keys, [0, 1]), expected)
+                self.assertEqual(store.batch_get_v2([transfer])[PoolName.KV], expected)
+        with patch.object(binding, "batch_put_from_multi_buffers", return_value=[0]):
+            self.assertEqual(store.batch_set_v1(keys, [0, 1]), [True, False])
+            self.assertEqual(store.batch_set_v2([transfer])[PoolName.KV], [True, False])
+
+        with patch.object(binding, "batch_is_exist", return_value=[1]):
+            self.assertEqual(store.batch_set_v1(keys, [0, 1]), [False, False])
+            self.assertEqual(
+                store.batch_set_v2([transfer])[PoolName.KV], [False, False]
+            )
+
+    def test_legacy_verification_checks_each_object_without_size_metadata(self):
+        store = _make_mooncake_store(_LegacyBinding())
+        store._batch_preprocess = lambda keys, indices: (
+            ["k0", "k1"],
+            [],
+            [[4, 8], [4, 8]],
+        )
+        for value, pages in ((bytes(12), 2), (bytes(11), 1), (bytes(13), 1), (None, 1)):
+            store.store.get = {"k0": bytes(12), "k1": value}.get
+            self.assertEqual(
+                store.verify_backup_prefix(["a", "b"], [0, 1], None), pages
+            )
+
     def test_batch_exists_v2_wraps_sidecar_exist(self):
         binding = _SupportedBinding(exist=1)
         store = _make_mooncake_store(binding)

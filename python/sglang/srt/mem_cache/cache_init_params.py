@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components.base import (
         TreeComponent,
     )
+    from sglang.srt.mem_cache.unified_cache.control_state import CacheControlConfig
 
 
 @dataclasses.dataclass
@@ -42,6 +43,10 @@ class CacheInitParams:
         default_factory=KvEventLoraNames
     )
     enable_session_radix_cache: bool = False
+    # None preserves legacy ordering and allocates no copy-claim state.
+    kv_control_config: Optional[CacheControlConfig] = dataclasses.field(
+        default=None, kw_only=True
+    )
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
