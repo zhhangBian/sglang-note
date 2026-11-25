@@ -1,7 +1,6 @@
 //! Session KV orchestration and its versioned Engine control protocol.
 mod client;
 mod config;
-mod feedback;
 pub mod models;
 pub mod operations;
 pub mod protocol;

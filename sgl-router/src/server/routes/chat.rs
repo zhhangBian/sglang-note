@@ -434,14 +434,10 @@ impl<'a> ModelRouting<'a> {
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
             let selected_url = workers.prefill.url.clone();
             if let (Some(runtime), Some(context)) = (&ctx.orchestration, &kv_context) {
-                let tokens = request.tokens.as_ref().filter(|_| {
-                    !request.cache_namespace.ambiguous
-                        && request.cache_namespace.lora_name.is_none()
-                });
                 runtime.routed(
                     context,
                     &selected_url,
-                    tokens.map(|t| t.ids.as_slice()),
+                    request.association_tokens(),
                     request.cache_namespace.cache_salt.as_deref(),
                     runtime
                         .request_prefetch_authorized(&headers)

@@ -1,10 +1,13 @@
 # Session KV cache orchestration
 
 The optional Router orchestrator lets an application prepare KV for a later
-request in the same task or branch. It uses the existing worker registry and
-cache index. Engines execute commands through HiCache and remain responsible for
-capacity, residency, and source reclamation. Normal inference remains available
-when control is disabled, a worker is unavailable, or preparation is incomplete.
+request in the same task or branch. Preparation uses the caller's worker URL
+when supplied. Otherwise the Router prefers the session's last routed worker,
+then considers healthy workers in load order. It checks prefix compatibility
+and the advertised action and transfer path before placing work. Engines execute
+commands through HiCache and manage capacity, residency, and source reclamation.
+Normal inference remains available when control is disabled, a worker is unavailable,
+or preparation is incomplete.
 
 Enable Engine KV control with `--kv-control-config` and hierarchical caching.
 Use a shared Mooncake namespace for storage transfers. Configure the Router with
@@ -57,13 +60,35 @@ Send lifecycle events to `POST /v1/kv/session/events`:
    PREFETCH to start. The event queues work without a predicted wait or timer.
    Send inference at its normal time even if the prefix is still being read.
 4. Send `task_finished` or `task_cancelled` to release the task's interests.
-   An ordinary inference completion does not end the task.
+   An ordinary inference completion leaves the task active.
+
+The Router reserves cleanup capacity at task admission and keeps a bounded FIFO
+of retired incarnations. Callers can omit `retirement_generation` throughout a
+task's lifecycle. New tasks can then start across FIFO rollovers without a
+capabilities lookup. A retired incarnation's replay protection lasts while its
+tombstone is in the FIFO.
+
+For replay protection after eviction, read `retirement_generation` from Router
+capabilities when starting a new task. Include that value in its task identity
+and inference `kv_context` throughout its lifetime, including query, cancel,
+and ack. Eviction advances the generation for new tasks. Active tasks keep the
+generation they started with.
 
 Use a new monotonic event revision and an event ID for each lifecycle transition.
 `query`, `cancel`, and `ack` use the same task and message ID as the original
 intent. Cancel detaches only that intent; shared physical work can continue for
 other interests. Release a PIN before acknowledging its intent and wait for
 quiescence before discarding an operation's receipt.
+
+If discovery confirms a replacement Engine epoch, the old operation reports
+`owner_lost: true` and becomes quiescent. Its result retains the last Engine
+receipt. Cancel and acknowledge the old interest to reclaim its operation slot.
+
+For a passive association, the Router records caller token IDs or tokens from
+the rendered chat template. Its scope reports the original input length in
+`original_end` and the page-aligned prefix length in `controlled_end` (up to
+65,536 tokens). A live claim lookup reports PIN protection. A scoped residency
+read reports PREFETCH coverage with the Engine's current cache watermark.
 
 For request-triggered prefetch, send `kv_context` on a generation request along
 with `x-kv-control-authorization: Bearer <control_bearer>`. The Router consumes

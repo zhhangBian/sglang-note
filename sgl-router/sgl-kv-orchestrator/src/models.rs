@@ -40,6 +40,9 @@ pub struct PrefixTarget {
 /// Identity survives worker changes; a worker epoch is deliberately absent.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SessionIdentity {
+    /// Optional admission generation. Preserve the caller's choice throughout the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_generation: Option<u64>,
     pub caller_id: String,
     pub session_id: String,
     pub incarnation: String,

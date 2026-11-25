@@ -612,6 +612,19 @@ impl PreparedRequest {
         Some(uuid::Uuid::new_v4().simple().to_string())
     }
 
+    pub(super) fn association_tokens(&self) -> Option<&[u32]> {
+        let tokens = self.tokens.as_ref()?;
+        // Multimodal routing IDs can contain synthetic media tags.
+        if self.media != MediaCounts::default()
+            || self.cache_namespace.ambiguous
+            || self.cache_namespace.lora_name.is_some()
+        {
+            return None;
+        }
+        (tokens.rendered_from_chat || self.parsed_body.as_ref().is_some_and(has_caller_input_ids))
+            .then_some(tokens.ids.as_slice())
+    }
+
     /// Use only IDs that will be sent to the Engine, and stay within the
     /// reusable input range. Routing-only token estimates are insufficient.
     pub(super) fn prefetch_prefix_len(&self) -> Option<usize> {

@@ -1,6 +1,5 @@
-use super::feedback::{Effect, FeedbackCache};
 use super::{
-    client::{confirmed_end, Capabilities, EngineClient},
+    client::{confirmed_end, CacheWatermark, Capabilities, EngineClient},
     OrchestrationConfig,
 };
 use crate::{
@@ -32,6 +31,8 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KvContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_generation: Option<u64>,
     pub session_id: String,
     pub incarnation: String,
     pub branch_id: String,
@@ -43,6 +44,7 @@ pub struct KvContext {
 impl KvContext {
     fn task(&self, caller: &str) -> SessionIdentity {
         SessionIdentity {
+            retirement_generation: self.retirement_generation,
             caller_id: caller.into(),
             session_id: self.session_id.clone(),
             incarnation: self.incarnation.clone(),
@@ -60,6 +62,7 @@ enum Message {
     Routed {
         context: KvContext,
         tokens: Option<Vec<u32>>,
+        original_end: usize,
         salt: Option<String>,
         worker: String,
         observed_at: Instant,
@@ -129,6 +132,9 @@ impl Runtime {
     /// caller is trusted; body caller_id is never consulted. Incarnations are
     /// explicit, so legacy session_id alone remains an unknown lifecycle signal.
     pub fn extract(&self, body: Bytes) -> Result<(Bytes, Option<KvContext>), String> {
+        if !may_have_kv_context(&body) {
+            return Ok((body, None));
+        }
         let mut value: Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
         let Some(meta) = value.as_object_mut().and_then(|v| v.remove("kv_context")) else {
             return Ok((body, None));
@@ -173,12 +179,52 @@ impl Runtime {
             worker: worker.into(),
             // Inference keeps the full input. Only the reusable control prefix
             // needs to fit the Engine's scope limit.
+            original_end: tokens.map_or(0, <[u32]>::len),
             tokens: tokens.map(|t| t[..t.len().min(MAX_SCOPE_TOKENS)].to_vec()),
             salt: salt.map(str::to_string),
             observed_at: Instant::now(),
             prefetch_end,
         });
     }
+}
+// An escaped JSON key can also spell kv_context. Only fall back for a
+// Unicode escape in a key, so escaped content in ordinary prompts stays cheap.
+fn may_have_kv_context(body: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return true;
+    };
+    if text.contains(r#""kv_context""#) {
+        return true;
+    }
+    if !text.contains(r"\u") {
+        return false;
+    }
+    let mut i = 0;
+    while i < body.len() {
+        if body[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let mut unicode = false;
+        while i < body.len() && body[i] != b'"' {
+            if body[i] == b'\\' {
+                i += 1;
+                unicode |= body.get(i) == Some(&b'u');
+            }
+            i += 1;
+        }
+        i += 1;
+        if unicode
+            && body
+                .get(i..)
+                .and_then(|tail| tail.iter().find(|b| !b.is_ascii_whitespace()))
+                == Some(&b':')
+        {
+            return true;
+        }
+    }
+    false
 }
 fn error(code: &str, reason: impl ToString) -> Value {
     json!({"success":false,"error":{"code":code,"reason":reason.to_string()}})
@@ -210,6 +256,8 @@ fn digest(value: &impl Serialize) -> String {
 }
 fn task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     Ok(SessionIdentity {
+        retirement_generation: Option::<u64>::deserialize(&value["retirement_generation"])
+            .map_err(|_| "invalid retirement_generation")?,
         caller_id: caller.into(),
         session_id: value["session_id"]
             .as_str()
@@ -240,6 +288,18 @@ fn validate_input(value: &Value) -> Result<(), String> {
             {
                 return Err(format!("{key} exceeds the safe integer domain"));
             }
+        }
+    }
+    // Leave a representable successor for closing a session or releasing a PIN.
+    if value["revision"].as_u64() == Some(crate::protocol::MAX_INTEGER) {
+        let needs_finish = value["kind"] == "session_event"
+            && !matches!(
+                value["event"].as_str(),
+                Some("task_finished" | "task_cancelled")
+            );
+        let needs_release = value["action"] == "sglang.pin" && value["mode"] != "release";
+        if needs_finish || needs_release {
+            return Err("revision leaves no room for cleanup".into());
         }
     }
     if let Some(ttl) = value.get("ttl_seconds").filter(|ttl| !ttl.is_null()) {
@@ -317,7 +377,8 @@ struct Job {
     quiescent: bool,
     deadline: Instant,
     last_error: Option<String>,
-    cache_watermark: Value,
+    owner_lost: bool,
+    cache_watermark: Option<CacheWatermark>,
     ready_end: u64,
     ready_at: Option<Instant>,
     terminal_residency_checked: bool,
@@ -356,11 +417,12 @@ impl Job {
 
     fn observe_claim(&mut self, claim: Value, cancel: bool) {
         // A finished acquisition cannot create a claim after the owner has
-        // confirmed it is absent or inactive. Residency feedback can still
+        // confirmed it is absent or inactive. A cache reset can still
         // invalidate the claim view without invalidating this cleanup proof.
         if cancel
             && self.has_terminal_result()
             && (claim.is_null()
+                || claim["active"] == false
                 || matches!(
                     claim["state"].as_str(),
                     Some("released" | "expired" | "invalidated")
@@ -372,6 +434,9 @@ impl Job {
     }
 
     fn has_final_receipt(&self) -> bool {
+        if self.owner_lost {
+            return true;
+        }
         if self.action == "sglang.pin" {
             let update = &self.result["update"];
             return self.pin_cleanup_confirmed
@@ -400,16 +465,28 @@ enum WaitFor {
     Jobs(Vec<(String, u64)>),
 }
 
+#[derive(Clone, Default)]
+struct WorkerOwner {
+    watermark: Option<CacheWatermark>,
+    caps: Option<Capabilities>,
+    discovery_failed: bool,
+}
+
+impl WorkerOwner {
+    fn available(&self) -> Option<&Capabilities> {
+        self.caps.as_ref().filter(|_| !self.discovery_failed)
+    }
+}
+
 /// One HTTP transaction at a time per worker. Only its own observation state
 /// travels with the transaction; the actor retains session and job ownership.
 struct WorkerPoll {
     url: String,
     client: EngineClient,
     caller: String,
-    feedback_limit: usize,
-    feedback: FeedbackCache,
-    caps: Option<Capabilities>,
-    effect: Effect,
+
+    owner: WorkerOwner,
+    invalidate: bool,
     job: Option<Job>,
 }
 
@@ -423,7 +500,7 @@ struct Actor {
     jobs: BTreeMap<String, Job>,
     jobs_by_spec: BTreeMap<String, String>,
     intents: BTreeMap<DemandId, Intent>,
-    caps: BTreeMap<String, Option<Capabilities>>,
+    owners: BTreeMap<String, WorkerOwner>,
     busy: BTreeMap<String, Option<String>>,
     deferred_polls: BTreeMap<String, String>,
     polls: FuturesUnordered<BoxFuture<'static, WorkerPoll>>,
@@ -432,7 +509,8 @@ struct Actor {
     tick_cursor: usize,
     events: BTreeMap<DemandId, (String, Value)>,
     event_expirations: VecDeque<(Instant, DemandId)>,
-    feedback: FeedbackCache,
+    finish_expirations: VecDeque<(Instant, DemandId)>,
+    discovery_due: BTreeSet<String>,
 }
 impl Actor {
     fn new(
@@ -451,7 +529,7 @@ impl Actor {
             jobs: BTreeMap::new(),
             jobs_by_spec: BTreeMap::new(),
             intents: BTreeMap::new(),
-            caps: BTreeMap::new(),
+            owners: BTreeMap::new(),
             busy: BTreeMap::new(),
             deferred_polls: BTreeMap::new(),
             polls: FuturesUnordered::new(),
@@ -460,11 +538,8 @@ impl Actor {
             tick_cursor: 0,
             events: BTreeMap::new(),
             event_expirations: VecDeque::new(),
-            feedback: FeedbackCache::new(
-                config.max_workers,
-                config.max_operations,
-                config.max_engine_bytes,
-            ),
+            finish_expirations: VecDeque::new(),
+            discovery_due: BTreeSet::new(),
         }
     }
     async fn run(mut self, mut rx: mpsc::Receiver<Message>) {
@@ -580,10 +655,12 @@ impl Actor {
         self.apply_message(message);
     }
     fn discover(&mut self, workers: Vec<String>) -> Option<WaitFor> {
-        if workers
-            .iter()
-            .any(|url| self.caps.get(url).is_some_and(Option::is_some))
-        {
+        if workers.iter().any(|url| {
+            self.owners
+                .get(url)
+                .and_then(WorkerOwner::available)
+                .is_some()
+        }) {
             return None;
         }
         for url in &workers {
@@ -594,10 +671,12 @@ impl Actor {
     fn wait_ready(&mut self, wait: &WaitFor) -> bool {
         match wait {
             WaitFor::Workers(workers) => {
-                workers
-                    .iter()
-                    .any(|url| self.caps.get(url).is_some_and(Option::is_some))
-                    || workers.iter().all(|url| !self.busy.contains_key(url))
+                workers.iter().any(|url| {
+                    self.owners
+                        .get(url)
+                        .and_then(WorkerOwner::available)
+                        .is_some()
+                }) || workers.iter().all(|url| !self.busy.contains_key(url))
             }
             WaitFor::Jobs(jobs) => {
                 let mut ready = true;
@@ -638,6 +717,7 @@ impl Actor {
             Message::Routed {
                 context,
                 tokens,
+                original_end,
                 salt,
                 worker,
                 observed_at,
@@ -646,7 +726,7 @@ impl Actor {
                 let task = context.task(&self.config.caller_id);
                 let preparation = tokens.and_then(|tokens| {
                     let request = prefetch_end.map(|end| (context.request(), end));
-                    match self.record(context, tokens, salt, &worker) {
+                    match self.record(context, original_end, tokens, salt, &worker) {
                         Ok(()) => request,
                         Err(reason) => {
                             tracing::debug!(%reason, "KV association unavailable");
@@ -696,9 +776,9 @@ impl Actor {
         if self.busy.contains_key(url) {
             return;
         }
-        if !self.caps.contains_key(url) && self.caps.len() == self.config.max_workers {
+        if !self.owners.contains_key(url) && self.owners.len() == self.config.max_workers {
             let Some(idle) = self
-                .caps
+                .owners
                 .keys()
                 .find(|other| {
                     !self.busy.contains_key(*other) && !self.jobs.values().any(|j| &j.url == *other)
@@ -707,18 +787,16 @@ impl Actor {
             else {
                 return;
             };
-            self.caps.remove(&idle);
-            self.feedback.forget_worker(&idle);
+            self.owners.remove(&idle);
+            self.discovery_due.remove(&idle);
         }
-        let caps = self.caps.entry(url.into()).or_default().clone();
+        let owner = self.owners.entry(url.into()).or_default().clone();
         let mut poll = WorkerPoll {
             url: url.into(),
             client: self.client.clone(),
             caller: self.config.caller_id.clone(),
-            feedback_limit: self.config.queue_capacity.clamp(1, 256),
-            feedback: self.feedback.for_worker(url),
-            caps,
-            effect: Effect::default(),
+            owner,
+            invalidate: false,
             job: None,
         };
         let cancel = job
@@ -733,7 +811,7 @@ impl Actor {
         });
         let shared_pin = cancel
             && job.as_ref().is_some_and(|j| {
-                j.action == "sglang.pin" && j.quiescent && self.shares_live_claim(j)
+                j.action == "sglang.pin" && j.has_terminal_result() && self.shares_live_claim(j)
             });
         self.busy
             .insert(url.into(), job.as_ref().map(|j| j.id.clone()));
@@ -741,6 +819,9 @@ impl Actor {
             if let Some(mut job) = job {
                 if !shared_pin {
                     if let Err(reason) = poll.advance(&mut job, cancel, request_only).await {
+                        // A scoped command error alone cannot prove owner loss.
+                        // Discover promptly even when this job keeps the worker busy.
+                        poll.refresh().await;
                         job.last_error = Some(reason);
                         job.ready_end = 0;
                         job.ready_at = None;
@@ -749,9 +830,8 @@ impl Actor {
                 }
                 job.polls += 1;
                 poll.job = Some(job);
-            } else if let Ok(caps) = poll.refresh().await {
-                let url = poll.url.clone();
-                let _ = poll.poll_feedback(&url, &caps).await;
+            } else {
+                poll.refresh().await;
             }
             poll
         }));
@@ -780,6 +860,10 @@ impl Actor {
         if self.busy.contains_key(worker) {
             return;
         }
+        if self.discovery_due.remove(worker) {
+            self.launch_poll(worker, None);
+            return;
+        }
         // A busy tick must still get a turn before further first submissions.
         if let Some(id) = self.deferred_polls.remove(worker).filter(|id| {
             self.jobs
@@ -803,9 +887,13 @@ impl Actor {
     }
     fn complete_poll(&mut self, poll: WorkerPoll) {
         self.busy.remove(&poll.url);
-        self.feedback.merge_worker(poll.feedback);
-        self.invalidate_feedback(&poll.url, poll.effect);
-        self.caps.insert(poll.url, poll.caps);
+        if poll.invalidate {
+            for job in self.jobs.values_mut().filter(|j| j.url == poll.url) {
+                job.ready_at = None;
+                job.ready_end = 0;
+                job.claim_view = Value::Null;
+            }
+        }
         if let Some(job) = poll.job.filter(|job| {
             // A terminal receipt may be acknowledged during a read-only poll.
             // A late observation must not bring back an acknowledged job.
@@ -818,22 +906,33 @@ impl Actor {
             }
             self.jobs.insert(job.id.clone(), job);
         }
-    }
-    fn invalidate_feedback(&mut self, url: &str, effect: Effect) {
-        for job in self.jobs.values_mut().filter(|job| job.url == url) {
-            if effect.ready {
-                job.ready_end = 0;
+        if let Some(caps) = poll.owner.available().filter(|new| {
+            self.owners
+                .get(&poll.url)
+                .and_then(|owner| owner.caps.as_ref())
+                .is_none_or(|old| old.epoch != new.epoch)
+        }) {
+            for job in self
+                .jobs
+                .values_mut()
+                .filter(|j| j.url == poll.url && j.caps.epoch != caps.epoch && !j.owner_lost)
+            {
+                job.owner_lost = true;
+                job.last_error = Some("owner_lost".into());
+                job.quiescent = true;
                 job.ready_at = None;
-            }
-            if effect.claims {
+                job.ready_end = 0;
                 job.claim_view = Value::Null;
+                let _ = self.book.mark_quiescent(&job.id);
             }
         }
+        self.owners.insert(poll.url, poll.owner);
     }
     fn shares_live_claim(&self, job: &Job) -> bool {
         self.jobs.values().any(|other| {
             other.id != job.id
                 && other.url == job.url
+                && other.caps.epoch == job.caps.epoch
                 && other.action == "sglang.pin"
                 && other.payload["claim_id"] == job.payload["claim_id"]
                 && self
@@ -843,37 +942,41 @@ impl Actor {
         })
     }
     fn needs_receipt_only(&self, job: &Job) -> bool {
-        job.has_final_receipt()
-            && (job.action == "sglang.demote"
-                || self.book.job(&job.id).is_some_and(|b| b.cancel_requested))
+        job.owner_lost
+            || job.has_final_receipt()
+                && (job.action == "sglang.demote"
+                    || self.book.job(&job.id).is_some_and(|b| b.cancel_requested))
     }
     fn needs_background_poll(&self, job: &Job) -> bool {
         // After the terminal observation, an explicit query can refresh the
-        // scope. Worker-wide feedback continues to invalidate old evidence.
+        // scope. Owner observations invalidate old evidence.
         !self.needs_receipt_only(job) && !job.terminal_residency_checked
     }
     fn drained(&self, job: &Job) -> bool {
         if job.has_final_receipt() {
             return true;
         }
-        self.busy.get(&job.url).and_then(Option::as_ref) != Some(&job.id)
-            && job.quiescent
-            && (job.action != "sglang.pin"
-                || job.never_submitted()
-                || !self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
-                || self.shares_live_claim(job))
+        if self.busy.get(&job.url).and_then(Option::as_ref) == Some(&job.id) || !job.quiescent {
+            return false;
+        }
+        job.never_submitted()
+            || (job.has_terminal_result()
+                && job.action == "sglang.pin"
+                && (!self.book.job(&job.id).is_some_and(|b| b.cancel_requested)
+                    || self.shares_live_claim(job)))
     }
     fn record(
         &mut self,
         context: KvContext,
+        original_end: usize,
         tokens: Vec<u32>,
         salt: Option<String>,
         worker: &str,
     ) -> Result<(), String> {
         let caps = self
-            .caps
+            .owners
             .get(worker)
-            .and_then(Option::as_ref)
+            .and_then(WorkerOwner::available)
             .ok_or("worker capabilities unknown")?;
         let task = context.task(&self.config.caller_id);
         if self.index.session_revision(&task).is_none() {
@@ -918,6 +1021,7 @@ impl Actor {
                 content: parent.expect("complete page"),
                 parent_frontier: None,
                 request: Some(context.request()),
+                original_end: Some(original_end as u64),
                 provenance: AssociationProvenance::RenderedRequest,
             })
             .map_err(|e| format!("{e:?}"))?;
@@ -969,6 +1073,19 @@ impl Actor {
             for id in intent.jobs {
                 if self.book.forget_job(&id) {
                     if let Some(job) = self.jobs.remove(&id) {
+                        if let Some(claim_id) = job.payload["claim_id"].as_str() {
+                            if !self
+                                .jobs
+                                .values()
+                                .any(|j| j.payload["claim_id"] == claim_id)
+                            {
+                                let _ = self.index.untrack_resource(
+                                    &demand.task,
+                                    ResourceKind::Claim,
+                                    claim_id,
+                                );
+                            }
+                        }
                         if self.jobs_by_spec.get(&job.spec) == Some(&id) {
                             self.jobs_by_spec.remove(&job.spec);
                         }
@@ -1032,12 +1149,14 @@ impl Actor {
         Ok(self.index.resolve(selector))
     }
     fn expire_event_receipts(&mut self, now: Instant) {
-        while let Some((expires, key)) = self.event_expirations.front() {
-            if *expires > now {
-                break;
+        for queue in [&mut self.event_expirations, &mut self.finish_expirations] {
+            while let Some((expires, key)) = queue.front() {
+                if *expires > now {
+                    break;
+                }
+                self.events.remove(key);
+                queue.pop_front();
             }
-            self.events.remove(key);
-            self.event_expirations.pop_front();
         }
     }
     fn api(&mut self, value: Value) -> Value {
@@ -1055,8 +1174,15 @@ impl Actor {
         } else {
             None
         };
+        let closing = matches!(
+            value["event"].as_str(),
+            Some("task_finished" | "task_cancelled")
+        );
         if let Some((key, fingerprint)) = &event {
             self.expire_event_receipts(Instant::now());
+            if !closing && self.index.is_retired(&key.task) {
+                return error("rejected", "RetiredIncarnation");
+            }
             if let Some((old, receipt)) = self.events.get(key) {
                 return if old == fingerprint {
                     receipt.clone()
@@ -1064,7 +1190,7 @@ impl Actor {
                     error("conflict", "event ID payload conflict")
                 };
             }
-            if self.events.len() >= self.config.max_operations {
+            if !closing && self.events.len() >= self.config.max_operations {
                 return error("capacity", "lifecycle replay budget exhausted");
             }
             if matches!(
@@ -1101,16 +1227,39 @@ impl Actor {
                 }
                 // Receipt expiry does not change session revisions or tombstones.
                 let expires = Instant::now() + Duration::from_millis(self.config.operation_ttl_ms);
-                self.event_expirations.push_back((expires, key.clone()));
+                // A full lifecycle receipt cache cannot block releasing an admitted task.
+                let queue = if closing {
+                    if self.finish_expirations.len() >= self.config.limits.max_tombstones {
+                        if let Some((_, oldest)) = self.finish_expirations.pop_front() {
+                            self.events.remove(&oldest);
+                        }
+                    }
+                    &mut self.finish_expirations
+                } else {
+                    &mut self.event_expirations
+                };
+                queue.push_back((expires, key.clone()));
                 self.events.insert(key, (fingerprint, result.clone()));
             }
         }
         result
     }
+    fn owners(&self) -> Vec<Value> {
+        self.owners
+            .iter()
+            .filter_map(|(url, owner)| {
+                let c = owner.caps.as_ref()?;
+                Some(
+                    json!({"worker_url":url, "engine_id":c.engine_id,"engine_epoch":c.epoch,
+                "cache_generation":c.generation,"cache_watermark":owner.watermark,"discovery_available":!owner.discovery_failed}),
+                )
+            })
+            .collect()
+    }
     fn apply(&mut self, value: Value) -> Result<Value, String> {
         let kind = value["kind"].as_str().ok_or("kind required")?;
         if kind == "feedback" {
-            return Ok(self.feedback.view());
+            return Ok(json!({"owners": self.owners()}));
         }
         if kind == "capabilities" {
             return Ok(json!({
@@ -1120,7 +1269,8 @@ impl Actor {
                 "lifecycle": "explicit",
                 "pin_tier": "host",
                 "dropped_route_events": self.dropped_routes.load(Ordering::Relaxed),
-                "feedback": self.feedback.view(),
+                "owners": self.owners(),
+                "retirement_generation": self.index.retirement_generation(),
                 "index": format!("{:?}", self.index.usage())
             }));
         }
@@ -1160,7 +1310,9 @@ impl Actor {
                 if !self.intents[&demand].released
                     && ids.iter().any(|id| {
                         self.jobs.get(id).is_some_and(|job| {
-                            job.action == "sglang.pin"
+                            !job.owner_lost
+                                && job.claim_view["active"] != false
+                                && job.action == "sglang.pin"
                                 && job.payload["mode"] != "release"
                                 && !matches!(
                                     job.claim_view["state"].as_str(),
@@ -1192,7 +1344,7 @@ impl Actor {
                             .map(|p| task_fn(p, &self.config.caller_id))
                             .transpose()?;
                         self.index
-                            .start_session(task, parent)
+                            .start_session_at(task, parent, revision)
                             .map_err(|e| format!("{e:?}"))?;
                         Ok(json!({"state":"active","lifecycle":"explicit"}))
                     }
@@ -1226,6 +1378,7 @@ impl Actor {
                             return Err("token capacity".into());
                         }
                         let context = KvContext {
+                            retirement_generation: task.retirement_generation,
                             session_id: task.session_id.clone(),
                             incarnation: task.incarnation.clone(),
                             branch_id: value["branch_id"]
@@ -1248,6 +1401,7 @@ impl Actor {
                         let worker = value["worker_url"].as_str().ok_or("worker_url required")?;
                         self.record(
                             context,
+                            tokens.len(),
                             tokens,
                             value["cache_salt"].as_str().map(str::to_string),
                             worker,
@@ -1363,7 +1517,7 @@ impl Actor {
         let available: Vec<_> = workers
             .into_iter()
             .filter_map(|url| {
-                let caps = self.caps.get(&url).and_then(Option::as_ref)?;
+                let caps = self.owners.get(&url).and_then(WorkerOwner::available)?;
                 Some((url, caps))
             })
             .collect();
@@ -1486,7 +1640,8 @@ impl Actor {
                         quiescent: false,
                         deadline,
                         last_error: None,
-                        cache_watermark: Value::Null,
+                        cache_watermark: None,
+                        owner_lost: false,
                         ready_end: 0,
                         ready_at: None,
                         terminal_residency_checked: false,
@@ -1586,14 +1741,14 @@ impl Actor {
         };
         let now = Instant::now();
         json!({"message_id":demand.id,"task":demand.task,"snapshot_revision":intent.frozen.snapshot_revision(),
-            "known_scope":intent.frozen.known_scope().iter().map(|s|json!({"branch":s.snapshot().map(|b|b.id().branch_id.clone()),"end_token":s.scope().end_token(),"content":s.scope().key().digest()})).collect::<Vec<_>>(),
+            "known_scope":intent.frozen.known_scope().iter().map(|s|json!({"branch":s.snapshot().map(|b|b.id().branch_id.clone()),"end_token":s.scope().end_token(),"controlled_end":s.scope().end_token(),"original_end":s.snapshot().map_or(s.scope().end_token(), |b| b.original_end()),"content":s.scope().key().digest()})).collect::<Vec<_>>(),
             "missing_scope":intent.frozen.missing_scope().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "materialization_required":intent.frozen.materialization_required().iter().map(|s|format!("{s:?}")).collect::<Vec<_>>(),
             "admission_gaps":intent.admission_gaps,
             "released":intent.released,"quiescent":intent.jobs.iter().all(|id|self.jobs.get(id).is_none_or(|j|self.drained(j))),
             "operations":intent.jobs.iter().filter_map(|id|self.jobs.get(id)).map(|j|json!({"child_id":j.id,"worker_url":j.url,"engine_id":j.caps.engine_id,"owner_epoch":j.caps.epoch,
-                "action":j.action,"result":j.result.as_ref(),"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"error":j.last_error,"quiescent":self.drained(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
-                "ready_scope":if !intent.released && self.feedback.current(&j.url,&j.cache_watermark) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
+                "action":j.action,"result":j.result.as_ref(),"cache_watermark":j.cache_watermark,"observation_age_ms":j.ready_at.map(|at|at.elapsed().as_millis()),"claim":j.claim_view,"owner_lost":j.owner_lost,"error":j.last_error,"quiescent":self.drained(j),"cancel_requested":self.book.job(&j.id).is_some_and(|b|b.cancel_requested),
+                "ready_scope":if !intent.released && self.owners.get(&j.url).is_some_and(|owner| owner.watermark == j.cache_watermark && owner.caps.as_ref().is_some_and(|c| c.epoch == j.caps.epoch)) && j.ready_at.is_some_and(|at|now.duration_since(at)<Duration::from_millis(self.config.poll_ms*2)) && j.ready_end>0 {json!({"start_token":0,"end_token":j.ready_end,"tier":j.payload["destination"]["tier"],"provenance":"engine_scoped_query"})}else{Value::Null}})).collect::<Vec<_>>()})
     }
     fn pump(&mut self) {
         let now = Instant::now();
@@ -1640,60 +1795,84 @@ impl Actor {
         }
         let candidates = self.workers();
         if let Some(worker) = candidates.get(self.tick_cursor % candidates.len().max(1)) {
-            self.launch_poll(worker, None);
+            if self.busy.get(worker).is_some_and(Option::is_some) {
+                self.discovery_due.insert(worker.clone());
+            } else {
+                self.launch_poll(worker, None);
+            }
         }
     }
 }
 
 impl WorkerPoll {
-    async fn refresh(&mut self) -> Result<Capabilities, String> {
-        match self.client.capabilities(&self.url).await {
-            Ok(caps) => {
-                self.effect.merge(self.feedback.bind(&self.url, &caps));
-                if self.caps.as_ref().is_some_and(|old| {
-                    old.epoch != caps.epoch
-                        || old.generation != caps.generation
-                        || old.compatibility != caps.compatibility
-                }) {
-                    self.effect.ready = true;
-                    self.effect.claims = true;
-                }
-                self.caps = Some(caps.clone());
-                Ok(caps)
-            }
-            Err(reason) => {
-                self.effect
-                    .merge(self.feedback.fail(&self.url, "capabilities unavailable"));
-                self.caps = None;
-                Err(reason)
-            }
+    async fn refresh(&mut self) {
+        let Ok(new) = self.client.capabilities(&self.url).await else {
+            self.invalidate = true;
+            self.owner.discovery_failed = true;
+            return;
+        };
+        self.owner.discovery_failed = false;
+        let same_cache = self.owner.caps.as_ref().is_some_and(|old| {
+            old.engine_id == new.engine_id
+                && old.epoch == new.epoch
+                && old.compatibility == new.compatibility
+                && old.generation == new.generation
+        });
+        let mut latest = new.cache_watermark.clone();
+        if same_cache
+            && self
+                .owner
+                .watermark
+                .as_ref()
+                .is_some_and(|high| latest.as_ref().is_none_or(|mark| mark.behind_version(high)))
+        {
+            latest.clone_from(&self.owner.watermark);
         }
+        self.invalidate |= !same_cache || latest != self.owner.watermark;
+        self.owner.watermark = latest;
+        self.owner.caps = Some(new);
     }
 
-    async fn poll_feedback(&mut self, url: &str, caps: &Capabilities) -> Result<(), String> {
-        let limit = self.feedback_limit;
-        let request = self
-            .feedback
-            .command(url, caps.context(&self.caller), limit);
-        let result = match request {
-            Ok(None) => return Ok(()),
-            Ok(Some(command)) => match self.client.command(url, &command).await {
-                Ok(page) => self.feedback.apply(url, &self.caller, &page, limit),
-                Err(reason) => Err(reason),
-            },
-            Err(reason) => Err(reason),
-        };
-        match result {
-            Ok(effect) => {
-                self.effect.merge(effect);
-                Ok(())
+    fn observe_watermark(&mut self, reply: &Value) -> Result<Option<CacheWatermark>, String> {
+        let mark = CacheWatermark::parse(&reply["cache_watermark"])?;
+        if let Some(new) = &mark {
+            if let Some(old) = &self.owner.watermark {
+                // A discovery watermark can confirm a change of cache source.
+                // Without one, serialized owner-scoped replies supply the binding.
+                let can_confirm = self
+                    .owner
+                    .caps
+                    .as_ref()
+                    .is_some_and(|c| c.cache_watermark.is_some());
+                if new.behind_version(old) || (can_confirm && !new.follows(old)) {
+                    self.invalidate = true;
+                    return Err("stale cache watermark or source changed".into());
+                }
             }
-            Err(reason) => {
-                let effect = self.feedback.fail(url, &reason);
-                self.effect.merge(effect);
-                Err(reason)
-            }
+            self.invalidate |= self.owner.watermark.as_ref() != Some(new);
+            self.owner.watermark = mark.clone();
         }
+        Ok(mark)
+    }
+
+    async fn observe_pin(
+        &mut self,
+        job: &mut Job,
+        included: Option<Value>,
+        cancel: bool,
+    ) -> Result<(), String> {
+        let claim = match included {
+            Some(claim) => claim,
+            None => self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?,
+        };
+        if !claim.is_null() && claim["owner_epoch"] != job.caps.epoch {
+            return Err("stale claim owner epoch".into());
+        }
+        if let Some(mark) = self.observe_watermark(&claim)? {
+            job.cache_watermark = Some(mark);
+        }
+        job.observe_claim(claim, cancel);
+        Ok(())
     }
     async fn advance(
         &mut self,
@@ -1722,21 +1901,17 @@ impl WorkerPoll {
             && job.has_terminal_result()
             && !job.releasing_pin
         {
-            let current = self.client.command(&job.url, &json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            if !current.is_null() && current["owner_epoch"] != job.caps.epoch {
-                return Err("stale claim owner epoch".into());
-            }
-            job.observe_claim(current, cancel);
+            self.observe_pin(job, None, cancel).await?;
             if job.pin_cleanup_confirmed {
                 job.last_error = None;
                 return Ok(());
             }
+            let revision = job.claim_view["revision"]
+                .as_u64()
+                .ok_or("claim revision absent")?;
             let payload = Arc::make_mut(&mut job.payload);
             payload["mode"] = json!("release");
-            payload["revision"] = json!(job.claim_view["revision"]
-                .as_u64()
-                .ok_or("claim revision absent")?
-                .saturating_add(1));
+            payload["revision"] = json!(revision.saturating_add(1));
             payload["ttl_seconds"] = Value::Null;
             let fields = payload.as_object_mut().expect("PIN payload object");
             fields.remove("priority");
@@ -1747,22 +1922,12 @@ impl WorkerPoll {
             job.quiescent = false;
             job.releasing_pin = true;
             job.result = Arc::new(Value::Null);
+            job.claim_view = Value::Null;
+            self.submit_action(job).await?;
+            job.last_error = None;
+            return Ok(());
         }
         let observe_residency = job.action == "sglang.prefetch" && !cancel && !request_only;
-        let live = if job.action == "sglang.pin" || observe_residency {
-            let live = self.refresh().await?;
-            if live.epoch != job.caps.epoch || live.compatibility != job.caps.compatibility {
-                return Err(
-                    "owner epoch/compatibility changed; reconcile old operation separately".into(),
-                );
-            }
-            job.caps.generation = live.generation;
-            live
-        } else {
-            // Owner-scoped operation commands validate epoch at the Engine.
-            // Discovery is needed for live location/claim evidence only.
-            job.caps.clone()
-        };
         if !job.submitted {
             if job.never_submitted() && Instant::now() >= job.deadline {
                 job.quiescent = true;
@@ -1770,7 +1935,7 @@ impl WorkerPoll {
             }
             self.submit_action(job).await?;
         }
-        if cancel && !job.releasing_pin && !job.cancel_sent && !job.quiescent {
+        if cancel && !job.releasing_pin && !job.cancel_sent && !job.has_terminal_result() {
             if let Some(reference) = &job.operation_ref {
                 let reply = self
                     .client
@@ -1787,61 +1952,57 @@ impl WorkerPoll {
             return Ok(());
         }
         // A final PREFETCH receipt is immutable; residency is checked separately.
-        if job.action != "sglang.prefetch" || !job.has_final_receipt() {
-            let reply = self
-                .client
-                .command(
-                    &job.url,
-                    &json!({"kind":"query","context":job.context,"message_id":job.message_id}),
-                )
-                .await?;
+        let mut included_claim = None;
+        if !job.has_terminal_result() {
+            let mut command =
+                json!({"kind":"query","context":job.context,"message_id":job.message_id});
+            if job.action == "sglang.pin" {
+                command["include_claim_id"] = job.payload["claim_id"].clone();
+            }
+            let reply = self.client.command(&job.url, &command).await?;
+            included_claim = reply.get("claim").cloned();
             self.update_result(job, reply)?;
         }
         job.ready_end = 0;
         job.ready_at = None;
-        // Cancellation and operation receipts do not depend on residency feedback.
-        if job.action == "sglang.pin" || observe_residency {
-            self.poll_feedback(&job.url, &live).await?;
-        }
         if job.action == "sglang.pin" {
-            let ticket = self.feedback.ticket(&job.url)?;
-            let claim=self.client.command(&job.url,&json!({"kind":"claim","context":job.context,"claim_id":job.payload["claim_id"]})).await?;
-            if !claim.is_null() && claim["owner_epoch"] != job.caps.epoch {
-                return Err("stale claim owner epoch".into());
-            }
-            self.poll_feedback(&job.url, &live).await?;
-            if !self.feedback.accept_claim(&job.url, &ticket) {
-                return Err("claim query crossed feedback invalidation".into());
-            }
-            job.observe_claim(claim, cancel);
+            self.observe_pin(job, included_claim, cancel).await?;
         }
         if observe_residency {
             // A terminal result alone cannot establish current location.
             let tier = job.payload["destination"]["tier"]
                 .as_str()
                 .unwrap_or("host");
-            let ticket = self.feedback.ticket(&job.url)?;
+            let live = self
+                .owner
+                .caps
+                .as_ref()
+                .ok_or("worker capabilities unavailable")?;
+            if live.epoch != job.caps.epoch
+                || live.engine_id != job.caps.engine_id
+                || !live.compatible(&job.prefix)
+            {
+                return Err("residency owner/compatibility changed".into());
+            }
             let snapshot = self
                 .client
-                .residency(&job.url, &live, &self.caller, &job.prefix, tier)
+                .residency(&job.url, live, &self.caller, &job.prefix, tier)
                 .await?;
-            self.poll_feedback(&job.url, &live).await?;
-            let effect =
-                self.feedback
-                    .accept_query(&job.url, &ticket, &snapshot["cache_watermark"])?;
-            self.effect.merge(effect);
-            job.cache_watermark = snapshot
-                .get("cache_watermark")
-                .cloned()
-                .unwrap_or(Value::Null);
-            job.ready_end = confirmed_end(&snapshot, &live, &job.prefix, tier)?;
+            job.ready_end = confirmed_end(&snapshot, live, &job.prefix, tier)?;
+            if let Some(caps) = &mut self.owner.caps {
+                if caps.generation.is_none() {
+                    caps.generation = snapshot["cache_generation"].as_u64();
+                    self.invalidate |= caps.generation.is_some();
+                }
+            }
+            job.cache_watermark = self.observe_watermark(&snapshot)?;
             job.ready_at = Some(Instant::now());
             job.terminal_residency_checked = job.has_final_receipt();
         }
         job.last_error = None;
         Ok(())
     }
-    async fn submit_action(&self, job: &mut Job) -> Result<(), String> {
+    async fn submit_action(&mut self, job: &mut Job) -> Result<(), String> {
         // Retry the same envelope after a lost response.
         job.attempted = true;
         let reply = self.client.command(&job.url, &json!({"kind":"submit","context":job.context,
@@ -1852,7 +2013,7 @@ impl WorkerPoll {
         job.submitted = true;
         Ok(())
     }
-    fn update_result(&self, job: &mut Job, reply: Value) -> Result<(), String> {
+    fn update_result(&mut self, job: &mut Job, reply: Value) -> Result<(), String> {
         let result = reply["results"]
             .as_array()
             .and_then(|a| a.iter().find(|r| r["ref"]["action_id"] == "transfer"))
@@ -1868,6 +2029,9 @@ impl WorkerPoll {
         if new < old {
             return Err("stale operation result".into());
         }
+        if let Some(mark) = self.observe_watermark(&reply)? {
+            job.cache_watermark = Some(mark);
+        }
         job.operation_ref = Some(result["ref"].clone());
         job.quiescent = result["update"]["quiescent"].as_bool().unwrap_or(false);
         job.result = Arc::new(result.clone());
@@ -1876,4 +2040,90 @@ impl WorkerPoll {
 }
 fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     task(value, caller)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_scan_handles_ordinary_text_and_escaped_keys() {
+        assert!(!may_have_kv_context(
+            br#"{"messages":[{"content":"hello \u00e9"}]}"#
+        ));
+        assert!(may_have_kv_context(br#"{"kv_context":{}}"#));
+        assert!(may_have_kv_context(br#"{"kv_\u0063ontext" : {}}"#));
+    }
+
+    #[tokio::test]
+    async fn only_confirmed_epoch_replacement_drains_an_uncertain_pin() {
+        let mut config: OrchestrationConfig =
+            serde_json::from_str(include_str!("../../kv-orchestration.example.json")).unwrap();
+        config.max_operations = 1;
+        config.limits.max_claims = 1;
+        let mut actor = Actor::new(
+            config,
+            Box::new(|| vec!["worker".into()]),
+            None,
+            Arc::default(),
+        );
+        let caps = Capabilities::parse(json!({
+            "engine_id":"engine","engine_epoch":"old","namespace":"weights",
+            "executor":{"cache_generation":1},
+            "public_protocol":{"prefix":{"layout_id":"full","page_size":1,"components":["full"],
+                "hash_scheme":"sglang.sha256.u32le.i64.v1"},"actions":{"sglang.pin":["1.0"]},
+                "pin_protections":[{"tier":"host","condition":"eviction_priority"}]}
+        }))
+        .unwrap();
+        actor.owners.insert(
+            "worker".into(),
+            WorkerOwner {
+                watermark: None,
+                caps: Some(caps.clone()),
+                discovery_failed: false,
+            },
+        );
+        let task = json!({"session_id":"task","incarnation":"one"});
+        actor.apply(json!({"kind":"session_event","event":"task_started","task":task,"revision":0,"event_id":"start"})).unwrap();
+        let mut pin = json!({"kind":"submit","task":task,"message_id":"pin","action":"sglang.pin",
+            "target":{"kind":"prefix","start_token":0,"end_token":2,"token_ids":[1,2],
+            "compatibility":caps.compatibility}, "location":{"tier":"host"},"mode":"acquire","claim_id":"hot","revision":1,"priority":3});
+        let view = actor.apply(pin.clone()).unwrap();
+        let id = view["operations"][0]["child_id"].as_str().unwrap();
+        actor.jobs.get_mut(id).unwrap().attempted = true;
+        let client = actor.client.clone();
+        let discovery = |observed: Option<Capabilities>| WorkerPoll {
+            url: "worker".into(),
+            caller: "router".into(),
+            client: client.clone(),
+            owner: WorkerOwner {
+                watermark: None,
+                discovery_failed: observed.is_none(),
+                caps: observed.or_else(|| Some(caps.clone())),
+            },
+            invalidate: true,
+            job: None,
+        };
+        actor
+            .apply(json!({"kind":"cancel","task":task,"message_id":"pin"}))
+            .unwrap();
+        let ack = json!({"kind":"ack","task":task,"message_id":"pin"});
+        actor.complete_poll(discovery(None));
+        assert!(actor.apply(ack.clone()).is_err());
+        let mut live = caps.clone();
+        live.generation = Some(2);
+        actor.complete_poll(discovery(Some(live.clone())));
+        assert!(actor.apply(ack.clone()).is_err());
+        live.epoch = "new".into();
+        actor.complete_poll(discovery(Some(live)));
+        assert!(actor.jobs[id].owner_lost);
+        assert_eq!(actor.apply(ack).unwrap()["acknowledged"], true);
+        assert_eq!(actor.book.counts(), (0, 0));
+        assert_eq!(actor.index.usage().claims, 0);
+        pin["message_id"] = json!("next");
+        assert_eq!(
+            actor.apply(pin).unwrap()["operations"][0]["owner_epoch"],
+            "new"
+        );
+    }
 }

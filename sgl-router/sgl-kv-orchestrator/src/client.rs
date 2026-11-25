@@ -6,14 +6,49 @@ use reqwest::{header::HeaderValue, Client};
 use serde_json::{json, Value};
 use std::time::Duration;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CacheWatermark {
+    source_id: String,
+    source_epoch: String,
+    generation: u64,
+    version: u64,
+}
+impl CacheWatermark {
+    pub fn parse(value: &Value) -> Result<Option<Self>, String> {
+        if value.is_null() {
+            return Ok(None);
+        }
+        let mark: Self =
+            serde_json::from_value(value.clone()).map_err(|_| "invalid cache watermark")?;
+        if [&mark.source_id, &mark.source_epoch]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 256)
+            || mark.generation > crate::protocol::MAX_INTEGER
+            || mark.version > crate::protocol::MAX_INTEGER
+        {
+            return Err("invalid cache watermark".into());
+        }
+        Ok(Some(mark))
+    }
+    fn same_source(&self, other: &Self) -> bool {
+        self.source_id == other.source_id && self.source_epoch == other.source_epoch
+    }
+    pub fn behind_version(&self, old: &Self) -> bool {
+        self.same_source(old) && self.generation == old.generation && self.version < old.version
+    }
+    pub fn follows(&self, old: &Self) -> bool {
+        self.same_source(old) && (self.generation, self.version) >= (old.generation, old.version)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Capabilities {
     pub engine_id: String,
     pub epoch: String,
     pub compatibility: Compatibility,
-    pub public: Value,
+    pub public: std::sync::Arc<Value>,
     pub generation: Option<u64>,
-    pub feedback: Option<Value>,
+    pub cache_watermark: Option<CacheWatermark>,
 }
 impl Capabilities {
     pub fn parse(value: Value) -> Result<Self, String> {
@@ -50,9 +85,9 @@ impl Capabilities {
                 .ok_or("epoch absent")?
                 .into(),
             generation: value["executor"]["cache_generation"].as_u64(),
-            feedback: value.get("feedback").filter(|v| !v.is_null()).cloned(),
+            cache_watermark: CacheWatermark::parse(&value["cache_watermark"])?,
             compatibility,
-            public,
+            public: public.into(),
         })
     }
     pub fn context(&self, caller: &str) -> Value {

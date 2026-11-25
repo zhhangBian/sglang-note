@@ -134,6 +134,7 @@ mod tests {
     fn demand(task: &str) -> DemandId {
         DemandId {
             task: SessionIdentity {
+                retirement_generation: None,
                 caller_id: "caller".into(),
                 session_id: task.into(),
                 incarnation: "1".into(),

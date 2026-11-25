@@ -10,7 +10,7 @@ use crate::models::{Compatibility, SessionIdentity};
 use crate::protocol::MAX_INTEGER;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Arc,
 };
 
@@ -181,6 +181,7 @@ pub struct BranchRevision {
     id: SnapshotId,
     session_revision: u64,
     parent_frontier: Option<ParentFrontier>,
+    original_end: u64,
     provenance: AssociationProvenance,
     content: Arc<ContentNode>,
 }
@@ -193,6 +194,9 @@ impl BranchRevision {
     }
     pub fn parent_frontier(&self) -> Option<&ParentFrontier> {
         self.parent_frontier.as_ref()
+    }
+    pub fn original_end(&self) -> u64 {
+        self.original_end
     }
     pub fn provenance(&self) -> AssociationProvenance {
         self.provenance
@@ -210,6 +214,7 @@ pub struct Association {
     pub content: ContentKey,
     pub parent_frontier: Option<ParentFrontier>,
     pub request: Option<RequestIdentity>,
+    pub original_end: Option<u64>,
     pub provenance: AssociationProvenance,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -246,8 +251,9 @@ pub struct IndexUsage {
 struct SessionRecord {
     revision: u64,
     parent: Option<SessionIdentity>,
-    branches: BTreeMap<String, SnapshotId>,
-    requests: BTreeMap<RequestIdentity, SnapshotId>,
+    start_revision: u64,
+    branches: BTreeMap<String, Arc<BranchRevision>>,
+    requests: BTreeMap<RequestIdentity, Arc<BranchRevision>>,
     claims: BTreeSet<String>,
     intents: BTreeSet<String>,
 }
@@ -262,6 +268,12 @@ pub struct SessionIndex {
     // an authoritative content ID nor a backend key. At most one per node.
     material_checksums: BTreeMap<ContentKey, [u8; 32]>,
     tombstones: BTreeSet<SessionIdentity>,
+    // Store the generation separately so unpinned identities stay unpinned on lookup.
+    retired: VecDeque<(SessionIdentity, u64)>,
+    retirement_generation: u64,
+    counts: IndexUsage,
+    history_cursor: Option<SnapshotId>,
+    content_cursor: Option<ContentKey>,
     material_bytes: usize,
 }
 impl SessionIndex {
@@ -274,6 +286,11 @@ impl SessionIndex {
             material: BTreeMap::new(),
             material_checksums: BTreeMap::new(),
             tombstones: BTreeSet::new(),
+            retired: VecDeque::new(),
+            retirement_generation: 0,
+            counts: IndexUsage::default(),
+            history_cursor: None,
+            content_cursor: None,
             material_bytes: 0,
         }
     }
@@ -309,21 +326,14 @@ impl SessionIndex {
         Ok(())
     }
     pub fn usage(&self) -> IndexUsage {
-        let mut u = IndexUsage {
+        IndexUsage {
             sessions: self.sessions.len(),
             history_revisions: self.history.len(),
             content_nodes: self.contents.len(),
             token_material_bytes: self.material_bytes,
             tombstones: self.tombstones.len(),
-            ..IndexUsage::default()
-        };
-        for s in self.sessions.values() {
-            u.branches += s.branches.len();
-            u.requests += s.requests.len();
-            u.claims += s.claims.len();
-            u.intents += s.intents.len();
+            ..self.counts
         }
-        u
     }
     /// No automatic incarnation inference from requests, cache events, or completions.
     pub fn start_session(
@@ -331,16 +341,43 @@ impl SessionIndex {
         id: SessionIdentity,
         parent: Option<SessionIdentity>,
     ) -> Result<(), IndexError> {
+        self.start_session_at(id, parent, 0)
+    }
+    pub fn retirement_generation(&self) -> u64 {
+        self.retirement_generation
+    }
+    pub(crate) fn is_retired(&self, id: &SessionIdentity) -> bool {
+        self.tombstones.contains(id)
+            || (id
+                .retirement_generation
+                .is_some_and(|g| g < self.retirement_generation)
+                && !self.sessions.contains_key(id))
+    }
+    pub fn start_session_at(
+        &mut self,
+        id: SessionIdentity,
+        parent: Option<SessionIdentity>,
+        revision: u64,
+    ) -> Result<(), IndexError> {
         self.check_session(&id)?;
         if self.tombstones.contains(&id) {
             return Err(IndexError::RetiredIncarnation);
         }
         if let Some(current) = self.sessions.get(&id) {
-            return if current.parent == parent {
+            return if current.parent == parent && current.start_revision == revision {
                 Ok(())
             } else {
                 Err(IndexError::Conflict)
             };
+        }
+        if id
+            .retirement_generation
+            .is_some_and(|g| g != self.retirement_generation)
+        {
+            return Err(IndexError::RetiredIncarnation);
+        }
+        if revision >= MAX_INTEGER {
+            return Err(IndexError::StaleRevision);
         }
         if self
             .sessions
@@ -357,10 +394,20 @@ impl SessionIndex {
         if self.sessions.len() >= self.limits.max_sessions {
             return Err(IndexError::Capacity("sessions"));
         }
+        // Reserve a retirement slot for every live task, including cascade members.
+        if self.sessions.len() >= self.limits.max_tombstones {
+            return Err(IndexError::Capacity("tombstones"));
+        }
+        if self.retired.len() == self.limits.max_tombstones - self.sessions.len() {
+            let (old, generation) = self.retired.pop_front().expect("reserved retirement slot");
+            self.tombstones.remove(&old);
+            self.retirement_generation = self.retirement_generation.max(generation + 1);
+        }
         self.sessions.insert(
             id,
             SessionRecord {
-                revision: 0,
+                revision,
+                start_revision: revision,
                 parent,
                 branches: BTreeMap::new(),
                 requests: BTreeMap::new(),
@@ -509,7 +556,7 @@ impl SessionIndex {
             .sessions
             .get_mut(id)
             .ok_or(IndexError::UnknownSession)?;
-        if revision <= task.revision || revision > MAX_INTEGER {
+        if revision <= task.revision || revision >= MAX_INTEGER {
             return Err(IndexError::StaleRevision);
         }
         task.revision = revision;
@@ -518,7 +565,7 @@ impl SessionIndex {
     pub(crate) fn branch_ids(&self, id: &SessionIdentity) -> Option<Vec<SnapshotId>> {
         self.sessions
             .get(id)
-            .map(|s| s.branches.values().cloned().collect())
+            .map(|s| s.branches.values().map(|b| b.id.clone()).collect())
     }
     pub fn branch(
         &self,
@@ -533,7 +580,7 @@ impl SessionIndex {
                 branch_id: branch.into(),
                 revision,
             },
-            None => s.branches.get(branch)?.clone(),
+            None => return s.branches.get(branch).cloned(),
         };
         self.history.get(&id).cloned()
     }
@@ -542,8 +589,7 @@ impl SessionIndex {
         session: &SessionIdentity,
         request: &RequestIdentity,
     ) -> Option<Arc<BranchRevision>> {
-        let id = self.sessions.get(session)?.requests.get(request)?;
-        self.history.get(id).cloned()
+        self.sessions.get(session)?.requests.get(request).cloned()
     }
     pub fn associate(
         &mut self,
@@ -551,7 +597,7 @@ impl SessionIndex {
     ) -> Result<Arc<BranchRevision>, IndexError> {
         let a = association;
         self.check_id(&a.branch_id)?;
-        if a.branch_revision > MAX_INTEGER || a.session_revision > MAX_INTEGER {
+        if a.branch_revision > MAX_INTEGER || a.session_revision >= MAX_INTEGER {
             return Err(IndexError::StaleRevision);
         }
         if let Some(r) = &a.request {
@@ -559,7 +605,7 @@ impl SessionIndex {
             self.check_id(&r.incarnation)?;
         }
         let s = self.sessions.get(&a.session).ok_or_else(|| {
-            if self.tombstones.contains(&a.session) {
+            if self.is_retired(&a.session) {
                 IndexError::RetiredIncarnation
             } else {
                 IndexError::UnknownSession
@@ -574,11 +620,12 @@ impl SessionIndex {
             // Exact retries are idempotent; a lower revision can never rewind latest.
             if old.session_revision == a.session_revision
                 && old.content.key == a.content
+                && old.original_end == a.original_end.unwrap_or(old.content.end_token)
                 && old.parent_frontier == a.parent_frontier
                 && old.provenance == a.provenance
                 && a.request
                     .as_ref()
-                    .is_none_or(|r| s.requests.get(r) == Some(&id))
+                    .is_none_or(|r| s.requests.get(r).map(|s| &s.id) == Some(&id))
             {
                 return Ok(old.clone());
             }
@@ -587,7 +634,7 @@ impl SessionIndex {
         if a.session_revision <= s.revision
             || s.branches
                 .get(&a.branch_id)
-                .is_some_and(|b| a.branch_revision <= b.revision)
+                .is_some_and(|b| a.branch_revision <= b.id.revision)
         {
             return Err(IndexError::StaleRevision);
         }
@@ -618,7 +665,11 @@ impl SessionIndex {
             }
         }
         let is_new_branch = !s.branches.contains_key(&a.branch_id);
-        let replaced = s.branches.get(&a.branch_id).cloned();
+        let replaced = s.branches.get(&a.branch_id).map(|b| b.id.clone());
+        let original_end = a.original_end.unwrap_or(content.end_token);
+        if original_end < content.end_token {
+            return Err(IndexError::InvalidPrefix);
+        }
         let u = self.usage();
         if is_new_branch && u.branches >= self.limits.max_branches {
             return Err(IndexError::Capacity("branches"));
@@ -633,11 +684,7 @@ impl SessionIndex {
             let reclaim = replaced.filter(|id| {
                 self.history
                     .get(id)
-                    .is_some_and(|old| Arc::strong_count(old) == 1)
-                    && !self
-                        .sessions
-                        .values()
-                        .any(|s| s.requests.values().any(|request| request == id))
+                    .is_some_and(|old| Arc::strong_count(old) == 2) // history and the outgoing branch head
             });
             if let Some(id) = reclaim {
                 self.history.remove(&id);
@@ -649,6 +696,7 @@ impl SessionIndex {
             id: id.clone(),
             session_revision: a.session_revision,
             parent_frontier: a.parent_frontier,
+            original_end,
             provenance: a.provenance,
             content,
         });
@@ -658,9 +706,11 @@ impl SessionIndex {
             .get_mut(&a.session)
             .expect("validated active session");
         s.revision = a.session_revision;
-        s.branches.insert(a.branch_id, id.clone());
+        self.counts.branches += usize::from(is_new_branch);
+        s.branches.insert(a.branch_id, snapshot.clone());
         if let Some(request) = a.request {
-            s.requests.insert(request, id);
+            self.counts.requests += 1;
+            s.requests.insert(request, snapshot.clone());
         }
         Ok(snapshot)
     }
@@ -675,11 +725,13 @@ impl SessionIndex {
             .sessions
             .get_mut(task)
             .ok_or(IndexError::UnknownSession)?;
-        if revision <= s.revision || revision > MAX_INTEGER {
+        if revision <= s.revision || revision >= MAX_INTEGER {
             return Err(IndexError::StaleRevision);
         }
         s.revision = revision;
-        Ok(s.requests.remove(request).is_some())
+        let removed = s.requests.remove(request).is_some();
+        self.counts.requests -= usize::from(removed);
+        Ok(removed)
     }
     pub fn track_resource(
         &mut self,
@@ -710,11 +762,11 @@ impl SessionIndex {
             .sessions
             .get_mut(task)
             .expect("validated active session");
-        match kind {
-            ResourceKind::Claim => &mut s.claims,
-            ResourceKind::Intent => &mut s.intents,
-        }
-        .insert(id.clone());
+        let (set, total) = match kind {
+            ResourceKind::Claim => (&mut s.claims, &mut self.counts.claims),
+            ResourceKind::Intent => (&mut s.intents, &mut self.counts.intents),
+        };
+        *total += usize::from(set.insert(id.clone()));
         Ok(OwnedResourceId {
             task: task.clone(),
             id,
@@ -730,11 +782,13 @@ impl SessionIndex {
             .sessions
             .get_mut(task)
             .ok_or(IndexError::UnknownSession)?;
-        Ok(match kind {
-            ResourceKind::Claim => &mut s.claims,
-            ResourceKind::Intent => &mut s.intents,
-        }
-        .remove(id))
+        let (set, total) = match kind {
+            ResourceKind::Claim => (&mut s.claims, &mut self.counts.claims),
+            ResourceKind::Intent => (&mut s.intents, &mut self.counts.intents),
+        };
+        let removed = set.remove(id);
+        *total -= usize::from(removed);
+        Ok(removed)
     }
     /// Explicit task finish/cancel share cleanup semantics. Default is non-cascading.
     /// This receipt names interests to revoke; it never deletes physical KV or
@@ -773,17 +827,17 @@ impl SessionIndex {
                 }
             }
         }
-        if tasks.len()
-            > self
-                .limits
-                .max_tombstones
-                .saturating_sub(self.tombstones.len())
-        {
-            return Err(IndexError::Capacity("tombstones"));
-        }
         let mut cleanup = Cleanup::default();
         for id in tasks {
             let s = self.sessions.remove(&id).expect("collected active task");
+            self.counts.branches -= s.branches.len();
+            self.counts.requests -= s.requests.len();
+            self.counts.claims -= s.claims.len();
+            self.counts.intents -= s.intents.len();
+            let generation = id
+                .retirement_generation
+                .unwrap_or(self.retirement_generation);
+            self.retired.push_back((id.clone(), generation));
             cleanup
                 .associations
                 .extend(self.history.keys().filter(|key| key.session == id).cloned());
@@ -808,34 +862,37 @@ impl SessionIndex {
         self.collect_garbage();
         Ok(cleanup)
     }
-    /// Tombstones intentionally have no automatic eviction. Exhaustion refuses
-    /// new cleanup atomically, rather than allowing retired tasks to resurrect.
-    /// A deployment may rotate the entire fenced Router ownership domain.
+    /// Advance each sweep by a fixed budget. External Arc holders can drop at
+    /// any time, so each cursor wraps and revisits previously live entries.
     pub fn collect_garbage(&mut self) {
-        let live: BTreeSet<_> = self
-            .sessions
-            .values()
-            .flat_map(|s| s.branches.values().chain(s.requests.values()))
-            .cloned()
-            .collect();
-        self.history
-            .retain(|id, snapshot| live.contains(id) || Arc::strong_count(snapshot) > 1);
-        loop {
-            let old = self.contents.len();
-            self.contents.retain(|key, node| {
-                if Arc::strong_count(node) > 1 {
-                    true
-                } else {
-                    self.material_checksums.remove(key);
-                    if let Some(tokens) = self.material.remove(key) {
-                        self.material_bytes -= tokens.len() * std::mem::size_of::<u32>();
-                    }
-                    false
-                }
-            });
-            if self.contents.len() == old {
-                break;
+        for id in sweep_keys(&self.history, &mut self.history_cursor) {
+            if Arc::strong_count(&self.history[&id]) == 1 {
+                self.history.remove(&id);
+            }
+        }
+        for key in sweep_keys(&self.contents, &mut self.content_cursor) {
+            if Arc::strong_count(&self.contents[&key]) == 1 {
+                self.contents.remove(&key);
+                self.material_checksums.remove(&key);
+                self.evict_material(&key);
             }
         }
     }
+}
+
+fn sweep_keys<K: Ord + Clone, V>(map: &BTreeMap<K, V>, cursor: &mut Option<K>) -> Vec<K> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    const BUDGET: usize = 32;
+    let start = cursor.as_ref().map_or(Unbounded, Excluded);
+    let keys: Vec<_> = map
+        .range((start, Unbounded))
+        .map(|(key, _)| key.clone())
+        .take(BUDGET)
+        .collect();
+    *cursor = if keys.len() == BUDGET {
+        keys.last().cloned()
+    } else {
+        None
+    };
+    keys
 }

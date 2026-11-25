@@ -31,6 +31,7 @@ fn key(digest: &str) -> ContentKey {
 }
 fn session(name: &str) -> SessionIdentity {
     SessionIdentity {
+        retirement_generation: None,
         caller_id: "caller".into(),
         session_id: name.into(),
         incarnation: "task-1".into(),
@@ -76,6 +77,7 @@ fn association(
         content: content.clone(),
         parent_frontier: None,
         request,
+        original_end: None,
         provenance: AssociationProvenance::RenderedRequest,
     }
 }
@@ -639,7 +641,7 @@ fn material_request_resource_and_tombstone_limits_fail_atomically() {
     config.max_requests = 1;
     config.max_claims = 1;
     config.max_intents = 1;
-    config.max_tombstones = 1;
+    config.max_tombstones = 2;
     let mut index = SessionIndex::new(config);
     let a = session("a");
     let b = session("b");
@@ -693,12 +695,6 @@ fn material_request_resource_and_tombstone_limits_fail_atomically() {
         .track_resource(&b, ResourceKind::Claim, "c".into())
         .unwrap();
     assert_eq!(
-        index.finish_task(&b, 1).unwrap_err(),
-        IndexError::Capacity("tombstones")
-    );
-    assert_eq!(index.usage().claims, 1);
-    assert_eq!(index.session_revision(&b), Some(0));
-    assert_eq!(
         index.start_session(a.clone(), None),
         Err(IndexError::RetiredIncarnation)
     );
@@ -708,6 +704,8 @@ fn material_request_resource_and_tombstone_limits_fail_atomically() {
         index.start_session(other, None),
         Err(IndexError::ActiveIncarnation)
     );
+    assert_eq!(index.finish_task(&b, 1).unwrap().claims.len(), 1);
+    assert_eq!(index.usage().claims, 0);
     let mut huge = session("x");
     huge.session_id = "x".repeat(129);
     assert_eq!(
@@ -850,4 +848,81 @@ fn scope_resolution_reports_empty_unknown_and_collected_history_explicitly() {
         }
     )));
     assert!(index.materialize(target.known_scope()[0].scope()).is_err());
+}
+
+#[test]
+fn retirement_reserves_cleanup_and_admits_unpinned_sessions_across_fifo_rollovers() {
+    let mut config = limits();
+    const LIMIT: usize = 1024;
+    config.max_tombstones = LIMIT;
+    config.max_sessions = LIMIT + 1;
+    let mut index = SessionIndex::new(config);
+    let pinned = SessionIdentity {
+        retirement_generation: Some(0),
+        ..session("pinned")
+    };
+    index.start_session(pinned.clone(), None).unwrap();
+    for n in 1..LIMIT {
+        index
+            .start_session(session(&format!("live-{n}")), None)
+            .unwrap();
+    }
+    assert_eq!(
+        index.start_session(session("overflow"), None),
+        Err(IndexError::Capacity("tombstones"))
+    );
+    index.finish_task(&pinned, 1).unwrap();
+    for n in 1..LIMIT {
+        index
+            .finish_task(&session(&format!("live-{n}")), 1)
+            .unwrap();
+    }
+    for n in 1..=10 * LIMIT {
+        let id = session(&format!("task-{n}"));
+        let start = 0;
+        index
+            .start_session_at(id.clone(), None, start)
+            .unwrap_or_else(|err| panic!("task-{n} admission failed: {err:?}"));
+        index
+            .track_resource(&id, ResourceKind::Claim, "priority-only-pin".into())
+            .unwrap();
+        assert_eq!(
+            index.finish_task(&id, start).unwrap_err(),
+            IndexError::StaleRevision
+        );
+        let receipt = index.finish_task(&id, start + 1).unwrap();
+        assert_eq!(
+            receipt.claims,
+            vec![OwnedResourceId {
+                task: id.clone(),
+                id: "priority-only-pin".into()
+            }]
+        );
+        assert_eq!(index.usage().claims, 0);
+        assert_eq!(index.usage().tombstones, LIMIT);
+        assert_eq!(
+            index.start_session_at(id, None, start),
+            Err(IndexError::RetiredIncarnation)
+        );
+    }
+
+    let generation = index.retirement_generation();
+    assert!(generation > 1);
+    assert_eq!(
+        index.start_session(pinned, None),
+        Err(IndexError::RetiredIncarnation)
+    );
+    let mut new = session("new-pinned");
+    new.retirement_generation = Some(generation - 1);
+    assert_eq!(
+        index.start_session(new.clone(), None),
+        Err(IndexError::RetiredIncarnation)
+    );
+    new.retirement_generation = Some(generation + 1);
+    assert_eq!(
+        index.start_session(new.clone(), None),
+        Err(IndexError::RetiredIncarnation)
+    );
+    new.retirement_generation = Some(generation);
+    index.start_session(new, None).unwrap();
 }
