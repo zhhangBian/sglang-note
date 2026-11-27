@@ -774,23 +774,9 @@ class Scheduler(
 
         self.init_weight_updater()
 
-        self.kv_control_service = None
-        if get_memory().kv_control_config is not None:
-            from sglang.srt.managers.kv_control.service import (
-                KVControlService,
-                runtime_config,
-            )
+        from sglang.srt.managers.kv_control.service import create_scheduler_service
 
-            self.kv_control_service = KVControlService(
-                self.tree_cache,
-                runtime_config(),
-                namespace_keys=True,
-                tp_group=(
-                    get_parallel().tp_group.cpu_group
-                    if get_parallel().tp_size > 1
-                    else None
-                ),
-            )
+        self.kv_control_service = create_scheduler_service(self.tree_cache)
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -2017,10 +2003,11 @@ class Scheduler(
 
     def init_request_dispatcher(self):
         from sglang.srt.managers.io_struct import KVControlReqInput
+        from sglang.srt.managers.kv_control.service import scheduler_control_handler
 
         self._request_dispatcher = TypeBasedDispatcher(
             [
-                (KVControlReqInput, self.handle_kv_control),
+                (KVControlReqInput, scheduler_control_handler(self.kv_control_service)),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -3341,6 +3328,9 @@ class Scheduler(
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
+        from sglang.srt.managers.kv_control.service import namespace_cache_salt
+
+        namespace_cache_salt(getattr(self, "kv_control_service", None), req)
         if (
             get_exec().moe.elastic_ep_backend is None
             or not self.tree_cache.supports_prefix_sharing()
@@ -3386,39 +3376,8 @@ class Scheduler(
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
-        """Constructor extension point; preparation belongs to the caller wrapper."""
+        """Extension point for request-local state, including session requests."""
         return Req(*args, **kwargs)
-
-    def _new_generation_req(
-        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
-    ) -> Req:
-        """Prepare every constructed subclass, including reconstructed sessions."""
-        kwargs.setdefault("kv_hints", recv_req.kv_hints)
-        req = self._create_generation_req(recv_req, *args, **kwargs)
-        if getattr(self, "kv_control_service", None) is not None:
-            from sglang.srt.managers.kv_control.contracts import ControlError
-
-            try:
-                self.kv_control_service.prepare_request(req)
-                self.kv_control_service.attach(
-                    req,
-                    recv_req.kv_hints,
-                    unsupported_request=recv_req.mm_inputs is not None,
-                )
-            except ControlError as error:
-                req.set_finish_with_abort(
-                    f"KV control rejected: {error.code}: {error}", status_code=400
-                )
-        return req
-
-    def handle_kv_control(self, recv_req):
-        from sglang.srt.managers.io_struct import KVControlReqOutput
-        from sglang.srt.managers.kv_control.service import dispatch
-
-        return KVControlReqOutput(
-            request_id=recv_req.request_id,
-            result=dispatch(self.kv_control_service, recv_req.command),
-        )
 
     def handle_generate_request(
         self,
@@ -3462,7 +3421,7 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = self._new_generation_req(
+            req = self._create_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -3553,7 +3512,7 @@ class Scheduler(
                 self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
-                req_factory=partial(self._new_generation_req, recv_req),
+                req_factory=partial(self._create_generation_req, recv_req),
             )
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
@@ -3575,7 +3534,7 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = self._new_generation_req(
+            req = self._create_generation_req(
                 recv_req,
                 recv_req.rid,
                 recv_req.input_text,
@@ -4218,8 +4177,6 @@ class Scheduler(
             token_indices_to_pool=recv_req.token_indices_to_pool,
             decision_layout=recv_req.decision_layout,
         )
-        if getattr(self, "kv_control_service", None) is not None:
-            self.kv_control_service.prepare_request(req)
         req.tokenizer = self.tokenizer
         self._maybe_namespace_elastic_radix_cache(req)
         self._record_kv_event_lora_name(req, recv_req.lora_name)
@@ -7105,14 +7062,9 @@ class Scheduler(
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
-            service = self.kv_control_service
-            deadline = service.next_deadline if service is not None else None
-            timeout_ms = (
-                1000
-                if deadline is None
-                else max(0, min(1000, math.ceil((deadline - time.monotonic()) * 1000)))
-            )
-            self.idle_sleeper.maybe_sleep(timeout_ms=timeout_ms)
+            from sglang.srt.managers.kv_control.service import sleep_on_idle
+
+            sleep_on_idle(self.idle_sleeper, self.kv_control_service)
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""

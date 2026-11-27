@@ -2,7 +2,6 @@
 """Public protocol adapters. Capabilities describe execution, not schema presence."""
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     ACTION_VERSION,
     HASH_SCHEME,
@@ -22,24 +21,17 @@ from sglang.srt.managers.kv_control.contracts import (
 
 def public_capabilities(caps):
     directions = caps.get("directions", {})
-    paths = {}
-    for action, permitted in (
-        (
-            "prefetch",
-            (("storage", "host"),),
-        ),
-        (
-            "demote",
-            (("host", "storage"),),
-        ),
-    ):
-        available = (
-            directions.get(action, ())
-            if caps.get("available", True)
-            and "sglang." + action in caps.get("actions", ())
-            else ()
+    paths = {
+        "sglang." + action: (path,)
+        if caps.get("available", True)
+        and "sglang." + action in caps.get("actions", ())
+        and path in directions.get(action, ())
+        else ()
+        for action, path in (
+            ("prefetch", ("storage", "host")),
+            ("demote", ("host", "storage")),
         )
-        paths["sglang." + action] = tuple(p for p in permitted if p in available)
+    }
     pins = caps.get("pin_protections", ()) if caps.get("available", True) else ()
     actions = {name: (ACTION_VERSION,) for name, values in paths.items() if values}
     if pins:
@@ -51,14 +43,7 @@ def public_capabilities(caps):
         paths=paths,
         pin_protections=pins,
         pin_query="claim" if pins else None,
-        pin_submission=("independent", "attached") if pins else (),
-        pin_request_cached="successful_checkpoint_existing_host_prefix"
-        if pins
-        else None,
-        pin_attached_claim_id="returned_effective_claim_id_per_binding"
-        if pins
-        else None,
-        pin_owner_task="optional_caller_identity" if pins else None,
+        pin_submission=("independent",) if pins else (),
         hash_only_execution=False,
         prefix=dict(
             namespace=caps.get("namespace"),
@@ -71,7 +56,6 @@ def public_capabilities(caps):
         storage_backend=directions.get("storage_backend"),
         backend_namespace_selection=bool(directions.get("backend_namespace")),
         backend_namespace=directions.get("backend_namespace"),
-        storage_targets=directions.get("storage_targets", False),
         storage_profile=directions.get("storage_profile"),
         timeout="relative_ms_cancel_and_drain",
         result_version="1.0",
@@ -135,8 +119,7 @@ def normalize_public(payload, caps):
         # Claim identity suffices even after its content/session was removed.
         return payload
     if (
-        target != "request_cached"
-        and not isinstance(target, PrefixTarget)
+        not isinstance(target, PrefixTarget)
         and target.allow_clip
         and (isinstance(payload, Pin) or not payload.allow_partial)
     ):
@@ -159,8 +142,6 @@ def normalize_public(payload, caps):
             raise ControlError(
                 "unsupported", "Execution requires complete token material from zero"
             )
-        # Blocks are observations, not key material. The executor derives its own
-        # storage keys from tokens and applies encode_cache_salt exactly once.
         target = TokensTarget(
             namespace=c.namespace,
             token_ids=target.token_ids,

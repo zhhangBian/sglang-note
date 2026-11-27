@@ -22,7 +22,6 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
     PrefetchAck,
-    PrefetchCancellation,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -199,7 +198,7 @@ class StorageOperation(BaseStorageOperation):
         self.pool_storage_result = PoolTransferResult.empty()
 
 
-class PrefetchOperation(PrefetchCancellation, StorageOperation):
+class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         handle: CacheRequestHandle,
@@ -214,6 +213,8 @@ class PrefetchOperation(PrefetchCancellation, StorageOperation):
         self.storage_read_metadata = storage_read_metadata
         self.handle = handle
         self.request_id = handle.rid
+        self._lock = threading.Lock()
+        self._terminated_flag = False
         self.storage_hit_count = 0
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
@@ -245,6 +246,14 @@ class PrefetchOperation(PrefetchCancellation, StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
+
+    def mark_terminate(self):
+        with self._lock:
+            self._terminated_flag = True
+
+    def is_terminated(self) -> bool:
+        with self._lock:
+            return self._terminated_flag
 
 
 @dataclass(frozen=True)

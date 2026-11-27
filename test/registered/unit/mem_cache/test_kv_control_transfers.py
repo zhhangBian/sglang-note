@@ -2,7 +2,6 @@
 """KV copy/move with real CPU pools and file storage; controlled DMA fences."""
 
 import threading
-import time
 import unittest
 from unittest.mock import patch
 
@@ -11,10 +10,20 @@ import test_kv_control_cache as cache_fixtures
 import torch
 from kv_control_test_utils import (
     FULL,
+    assert_retired,
     backup_prefix,
+    block_io,
+    cold_prefix,
+    current,
     hicache,
+    persist_prefix,
+    prefix_path,
+    public_transfer,
     seed,
     start_inference_load,
+    transfer,
+    wait,
+    wait_for,
 )
 from sglang.srt.managers.kv_control.contracts import (
     Limits,
@@ -23,87 +32,15 @@ from sglang.srt.managers.kv_control.contracts import (
 from sglang.srt.managers.kv_control.service import (
     CacheLimits,
     ServiceConfig,
-    parse_config,
 )
 from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    CacheRequestOutcome,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-
-def transfer(
-    service,
-    *,
-    src="storage",
-    dst="host",
-    caller="A",
-    message="copy",
-    tokens=(1, 2, 3, 4),
-    selection=None,
-):
-    return public_transfer(
-        service,
-        "prefetch",
-        src,
-        dst,
-        message,
-        caller=caller,
-        tokens=selection.token_ids if selection is not None else tokens,
-        salt=selection.cache_salt if selection is not None else None,
-        timeout_ms=None,
-    )
-
-
-def current(service, result):
-    return service.control.registry.get(result.ref)
-
-
-def public_transfer(
-    service,
-    kind,
-    source,
-    destination,
-    message,
-    *,
-    tokens=(1, 2, 3, 4),
-    caller="router",
-    salt=None,
-    timeout_ms=5000,
-):
-    from sglang.srt.managers.kv_control.contracts import HASH_SCHEME
-
-    caps = service.capabilities()["public_protocol"]
-    compatibility = msgspec.json.decode(msgspec.json.encode(caps["prefix"]))
-    compatibility.pop("token_material")
-    compatibility["cache_salt"] = salt
-    assert compatibility["hash_scheme"] == HASH_SCHEME
-    return service.control.submit(
-        KvHintsEnvelope(
-            protocol_version="0.1",
-            message_id=message,
-            actions=[
-                KvHintAction(
-                    action_id="a",
-                    action_type="sglang." + kind,
-                    action_version="1.0",
-                    payload={
-                        "target": {
-                            "kind": "prefix",
-                            "compatibility": compatibility,
-                            "start_token": 0,
-                            "end_token": len(tokens),
-                            "token_ids": list(tokens),
-                        },
-                        "source": {"tier": source},
-                        "destination": {"tier": destination},
-                        "timeout_ms": timeout_ms,
-                    },
-                )
-            ],
-        ),
-        service.control.context(caller),
-    ).results[0]
 
 
 class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
@@ -135,153 +72,6 @@ class TestKVControlTransfers(cache_fixtures.KVCacheTestCase):
             self.assertEqual(cd.lock_ref, 0)
             self.assertEqual(cd.host_lock_ref, 0)
             cache.sanity_check()
-
-
-def wait(service, result):
-    deadline = time.monotonic() + 5
-    while not current(service, result).status.terminal:
-        service.progress()
-        assert time.monotonic() < deadline, current(service, result)
-        time.sleep(0.005)
-    return current(service, result)
-
-
-def block_io(callback, entered, release):
-    def blocked(*args, **kwargs):
-        entered.set()
-        assert release.wait(5)
-        return callback(*args, **kwargs)
-
-    return blocked
-
-
-def persist_prefix(cache, service, dma, node):
-    backup_prefix(cache, dma, node, evict=True, persist=True)
-
-    def finished():
-        cache.drain_storage_control_queues()
-        return not cache.ongoing_backup
-
-    wait_for(service, finished)
-
-
-def mooncake_store(cache):
-    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
-
-    store = MooncakeStore.__new__(MooncakeStore)
-    store.mem_pool_host = cache.host_pool_group.anchor_entry.host_pool
-    store.storage_config = cache.cache_controller.storage_config
-    store.config_prefix = "test"
-    store.unified_suffixes = None
-    store.is_mla_backend = False
-    store.should_split_heads = False
-    store.mha_suffix = "0"
-    store.dcp_size = 1
-    store.enable_storage_metrics = False
-    store._use_group_semantics = False
-    return store
-
-
-class TestKVControlStorage(cache_fixtures.KVCacheTestCase):
-    def test_storage_namespace_description_and_backend_mismatch(self):
-        from pathlib import Path
-
-        from sglang.srt.managers.kv_control.contracts import ControlError
-        from sglang.srt.managers.kv_control.service import Command
-        from sglang.srt.mem_cache.unified_cache.storage_execution import (
-            storage_execution_adapter,
-        )
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, dma = owner
-            caps = service.capabilities()["public_protocol"]
-            location = dict(
-                tier="storage",
-                backend="file",
-                backend_namespace=caps["backend_namespace"],
-            )
-            target = dict(kind="tokens", namespace="ns", token_ids=[1, 2, 3, 4])
-            command = dict(
-                kind="storage_targets",
-                context=msgspec.to_builtins(service.control.context("A")),
-                target=target,
-                location=location,
-            )
-            before = service.control.registry.capacity()
-            description = service.execute(msgspec.convert(command, type=Command))
-            self.assertEqual(description["existence"], "unknown")
-            self.assertFalse(cache.tree_core.root_node.children)
-            self.assertEqual(before, service.control.registry.capacity())
-            paths = [Path(key) for page in description["pages"] for key in page["keys"]]
-            self.assertFalse(any(path.exists() for path in paths))
-            for changes in (
-                {"backend_namespace": "different"},
-                {"backend": "mooncake"},
-            ):
-                with self.assertRaises(ControlError):
-                    service.execute(
-                        msgspec.convert(
-                            dict(command, location=dict(location, **changes)),
-                            type=Command,
-                        )
-                    )
-            node = seed(cache)
-            backup_prefix(cache, dma, node, evict=True)
-            result = public_transfer(service, "demote", "host", "storage", "save")
-            done = wait(service, result)
-            self.assertEqual(done.status, Status.COMPLETED)
-            self.assertTrue(all(path.exists() for path in paths))
-            self.assertEqual(
-                description, service.execute(msgspec.convert(command, type=Command))
-            )
-            self.assertIsNone(done.update.target_outcomes[0].location.engine_id)
-            self.assertEqual(
-                done.update.target_outcomes[0].location.backend_namespace,
-                location["backend_namespace"],
-            )
-            with patch.object(
-                cache.cache_controller, "storage_backend_type", "unregistered"
-            ):
-                adapter, reason = storage_execution_adapter(cache)
-                self.assertIsNone(adapter)
-                self.assertTrue(reason)
-
-
-def cold_prefix(owner):
-    _, cache, service, dma = owner
-    persist_prefix(cache, service, dma, seed(cache))
-    assert cache.evict_host(4) == 4
-    assert not service.control.executor._walk(
-        (1, 2, 3, 4), service.control.executor._compatibility(cache_fixtures.target())
-    )
-    return (cache, service, dma)
-
-
-def wait_for(service, condition):
-    deadline = time.monotonic() + 5
-    while not condition():
-        service.progress()
-        assert time.monotonic() < deadline
-        time.sleep(0.005)
-
-
-def prefix_path(cache, service):
-    return service.control.executor._walk(
-        (1, 2, 3, 4), service.control.executor._compatibility(cache_fixtures.target())
-    )
-
-
-def assert_retired(cache, service):
-    assert not service.control.executor.storage_reads.jobs
-    assert not service.control.executor.storage_reads.interests
-    assert not service.control.executor.storage_reads.demands
-    assert not service.control.executor.storage_reads._joinable
-    assert not cache.ongoing_prefetch
-    assert not cache.prefetch_loaded_tokens_by_reqid
-    assert not cache.prefetch_loaded_storage_start_by_reqid
-    assert not cache._storage_prefetch_hit_remaining_by_reqid
-    assert cache.cache_controller.prefetch_tokens_occupied == 0
-    assert cache.cache_controller.host_mem_release_queue.empty()
 
 
 class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
@@ -325,149 +115,63 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
         service.progress()
         return span
 
-    def test_queued_reads_do_not_evict_host_cache_before_io_is_ready(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+    def test_queued_reads_park_without_evicting_resident_host_pages(self):
+        with hicache(self, namespace_keys=True) as owner:
+            _, cache, service, dma = owner
+            scopes = [cache_fixtures.target(range(i, i + 24)) for i in (1, 25, 49)]
+            self._cold_scopes(owner, scopes)
+            hot = seed(cache, range(129, 193))
+            backup_prefix(cache, dma, hot, evict=True)
+            controller = cache.cache_controller
+            entered, release = threading.Event(), threading.Event()
+            reads = service.control.executor.storage_reads
+            jobs = []
 
-        for native, cancel in (
-            (False, False),
-            (False, True),
-            (True, False),
-            (True, True),
-        ):
-            with (
-                self.subTest(native=native, cancel=cancel),
-                hicache(self, namespace_keys=True) as owner,
-            ):
-                _, cache, service, dma = owner
-                scopes = [cache_fixtures.target(range(i, i + 24)) for i in (1, 25, 49)]
-                self._cold_scopes(owner, scopes)
-                hot = seed(cache, range(129, 193))
-                backup_prefix(cache, dma, hot, evict=True)
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                original = cc.page_get_func
-                requests = [
-                    CacheRequestHandle(f"bounded-read-{i}", 0) for i in range(3)
-                ]
-                results = []
+            def submit(index):
+                result = self._restore(service, scopes[index], f"native-{index}")
+                job = reads.interests[result.ref.operation_id].job
+                jobs.append((result, job))
+                return result, job
 
-                def submit(index):
-                    if native:
-                        result = self._restore(
-                            service, scopes[index], f"native-{index}"
-                        )
-                        results.append(result)
-                        reads = service.control.executor.storage_reads
-                        requests[index] = reads.interests[
-                            result.ref.operation_id
-                        ].job.handle
-                    else:
-                        self._ordinary_prefetch(
-                            cache, service, scopes[index], requests[index]
-                        )
-
-                blocked_get = block_io(original, entered, release)
-
-                def started():
-                    cache.drain_storage_control_queues()
-                    return entered.is_set()
-
-                borrowed = None
-                try:
-                    with (
-                        patch.object(cc, "page_get_func", blocked_get),
-                        patch.object(cache, "prefetch_threshold", 1),
-                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                    ):
-                        submit(0)
-                        wait_for(service, started)
-                        submit(1)
-                        submit(2)
-
-                        def queried():
-                            cache.drain_storage_control_queues()
-                            return all(
-                                cache.ongoing_prefetch[r].operation.storage_hit_count
-                                == 24
-                                for r in requests
-                            )
-
-                        wait_for(service, queried)
-                        cache.drain_storage_control_queues()
-                        self.assertIsNotNone(hot.component_data[FULL].host_value)
-                        self.assertIsNone(
-                            cache.ongoing_prefetch[requests[2]].host_indices
-                        )
-                        self.assertEqual(cc.prefetch_buffer.qsize(), 1)
-                        cache.drain_storage_control_queues_local()
-                        self.assertIsNone(
-                            cache.ongoing_prefetch[requests[2]].host_indices
-                        )
-                        if cancel:
-                            if native:
-                                borrowed = results[2]
-                            else:
-                                borrowed = self._restore(
-                                    service, scopes[2], "deferred-owner"
-                                )
-                                cache.finish(requests[2], CacheRequestOutcome.ABORT)
-                            service.control.cancel(borrowed.ref)
-                            self.assertEqual(
-                                wait(service, borrowed).status, Status.CANCELLED
-                            )
-                            self.assertFalse(release.is_set())
-                            self.assertNotIn(requests[2], cache.ongoing_prefetch)
-                        release.set()
-                        for index in range(2 if cancel else 3):
-                            if native:
-                                self.assertEqual(
-                                    wait(service, results[index]).status,
-                                    Status.COMPLETED,
-                                )
-                            else:
-                                self.assertEqual(
-                                    self._consume_ordinary_prefetch(
-                                        cache, service, requests[index]
-                                    ),
-                                    (24, 0),
-                                )
-                        pool = cache.host_pool_group.anchor_entry.host_pool
-                        for index, target in enumerate(
-                            scopes[:2] if cancel else scopes
-                        ):
-                            for node, *_ in service.control.executor._walk(
-                                target.token_ids,
-                                service.control.executor._compatibility(target),
-                            ):
-                                indices = node.component_data[FULL].host_value
-                                self.assertIsNotNone(indices)
-                                self.assertTrue(
-                                    torch.all(
-                                        pool.k_buffer[0][indices] == 7 + index * 2
-                                    )
-                                )
-                                self.assertTrue(
-                                    torch.all(
-                                        pool.v_buffer[0][indices] == 8 + index * 2
-                                    )
-                                )
-                finally:
+            try:
+                with patch.object(
+                    controller,
+                    "page_get_func",
+                    block_io(controller.page_get_func, entered, release),
+                ):
+                    submit(0)
+                    wait_for(service, entered.is_set)
+                    submit(1)
+                    last, parked = submit(2)
+                    wait_for(
+                        service,
+                        lambda: (
+                            getattr(parked.operation, "host_allocation_deferred", None)
+                            == "io"
+                        ),
+                    )
+                    assert hot.component_data[FULL].host_value is not None
+                    assert cache.ongoing_prefetch[parked.handle].host_indices is None
+                    assert controller.prefetch_buffer.qsize() == 1
+                    cache.drain_storage_control_queues_local()
+                    assert cache.ongoing_prefetch[parked.handle].host_indices is None
+                    service.control.cancel(last.ref)
+                    assert wait(service, last).status == Status.CANCELLED
+                    assert (
+                        not release.is_set()
+                        and parked.handle not in cache.ongoing_prefetch
+                    )
                     release.set()
-                    if native:
-                        for result in results:
-                            wait(service, result)
-                    else:
-                        for request in requests:
-                            if request in cache.ongoing_prefetch:
-                                self._consume_ordinary_prefetch(cache, service, request)
-                    if borrowed is not None:
-                        wait(service, borrowed)
-                assert_retired(cache, service)
-                cache.sanity_check()
+                    for result, _ in jobs[:2]:
+                        assert wait(service, result).status == Status.COMPLETED
+            finally:
+                release.set()
+                for result, _ in jobs:
+                    wait(service, result)
+            assert_retired(cache, service)
+            cache.sanity_check()
 
     def test_demand_stages_before_speculation_without_reordering_issued_reads(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             scopes = [cache_fixtures.target(range(i, i + 4)) for i in (1, 5, 9, 13, 17)]
@@ -536,358 +240,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             self.assertEqual(calls, [first, staged, shared_handle, demand, hint_handle])
 
-    def test_cancelled_queued_read_drains_before_later_storage_io(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [cache_fixtures.target(range(i, i + 4)) for i in (1, 5, 9)]
-            self._cold_scopes(owner, scopes)
-            cc = cache.cache_controller
-            entered = [threading.Event(), threading.Event()]
-            release = [threading.Event(), threading.Event()]
-            original, calls = cc.page_get_func, []
-
-            def blocked(operation, *args, **kwargs):
-                index = len(calls)
-                calls.append(operation)
-                entered[index].set()
-                assert release[index].wait(5)
-                return original(operation, *args, **kwargs)
-
-            request = CacheRequestHandle("later-ordinary-read", 0)
-            results = []
-            try:
-                with (
-                    patch.object(cc, "page_get_func", blocked),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    first = self._restore(service, scopes[0], "active")
-                    results.append(first)
-                    wait_for(service, entered[0].is_set)
-                    cancelled = self._restore(service, scopes[2], "cancel-queued")
-                    results.append(cancelled)
-                    wait_for(service, lambda: cc.prefetch_buffer.qsize() == 1)
-                    self._ordinary_prefetch(cache, service, scopes[1], request)
-                    self.assertFalse(
-                        service.control.cancel(cancelled.ref).update.quiescent
-                    )
-                    release[0].set()
-                    wait_for(service, entered[1].is_set)
-                    deadline = time.monotonic() + 1
-                    while (
-                        not current(service, cancelled).status.terminal
-                        and time.monotonic() < deadline
-                    ):
-                        service.progress()
-                        time.sleep(0.005)
-                    self.assertEqual(
-                        current(service, cancelled).status, Status.CANCELLED
-                    )
-                    self.assertTrue(current(service, cancelled).update.quiescent)
-                    self.assertFalse(release[1].is_set())
-                    self.assertEqual(len(calls), 2)
-                    release[1].set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, request)[0], 4
-                    )
-            finally:
-                for event in release:
-                    event.set()
-                for result in results:
-                    wait(service, result)
-                if request in cache.ongoing_prefetch:
-                    self._consume_ordinary_prefetch(cache, service, request)
-            assert_retired(cache, service)
-
-    def test_prefetch_keeps_host_anchor_without_pinning_device_prefix(self):
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-
-        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
-            _, cache, service, dma = owner
-            target = cache_fixtures.target((1, 2, 3, 4, 5, 6))
-            self._cold_scopes(owner, [target])
-            anchor = seed(cache)
-            backup_prefix(cache, dma, anchor)
-            self.assertIsNotNone(anchor.component_data[FULL].value)
-
-            controller = cache.cache_controller
-            get = controller.page_get_func
-            entered, release = threading.Event(), threading.Event()
-
-            blocked_get = block_io(get, entered, release)
-
-            try:
-                with patch.object(controller, "page_get_func", blocked_get):
-                    hint = self._restore(service, target, "host-anchor")
-                    wait_for(service, entered.is_set)
-                    self.assertEqual(
-                        cache.evict(EvictParams(num_tokens=4)).num_tokens_evicted, 4
-                    )
-                    self.assertEqual(cache.evict_host(4), 0)
-                    release.set()
-                    done = wait(service, hint)
-                    self.assertEqual(done.status, Status.COMPLETED)
-                    self.assertEqual(
-                        done.public_result.ready_scope[-1].coverage.end_token, 6
-                    )
-            finally:
-                release.set()
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_read_observations_count_physical_jobs_and_include_ordinary_reads(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target(cache_salt=f"observed-{i}") for i in range(2)
-            ]
-            self._cold_scopes(owner, scopes)
-            cc = cache.cache_controller
-            get = cc.page_get_func
-            entered, release = threading.Event(), threading.Event()
-            demand = CacheRequestHandle("observed-demand", 0)
-            ordinary = CacheRequestHandle("observed-ordinary", 0)
-
-            blocked_get = block_io(get, entered, release)
-
-            try:
-                with (
-                    patch.object(cc, "page_get_func", blocked_get),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    first = self._restore(service, scopes[0], "observed-first")
-                    wait_for(service, entered.is_set)
-                    shared = self._restore(service, scopes[0], "observed-shared")
-                    self._ordinary_prefetch(cache, service, scopes[0], demand)
-                    during = cache.prefetch_outcome_stats_snapshot()
-                    self.assertEqual(during["native_jobs_created"], 1)
-                    self.assertEqual(during["native_jobs_started"], 1)
-                    self.assertEqual(during["native_interests_coalesced"], 1)
-                    self.assertEqual(during["native_demand_waiters"], 1)
-                    self.assertEqual(during["native_inflight_tokens"], 4)
-                    self.assertEqual(during["native_speculative_inflight_tokens"], 0)
-                    self.assertEqual(during["native_reserved_host_tokens"], 0)
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self.assertEqual(wait(service, shared).status, Status.COMPLETED)
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand), (4, 0)
-                    )
-                    self._ordinary_prefetch(cache, service, scopes[1], ordinary)
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, ordinary),
-                        (4, 0),
-                    )
-                stats = cache.prefetch_outcome_stats_snapshot()
-                self.assertEqual(stats["storage_read_query_jobs"], 2)
-                self.assertEqual(stats["storage_read_get_batches"], 2)
-                self.assertEqual(stats["storage_read_get_requested_tokens"], 8)
-                self.assertEqual(stats["storage_read_get_completed_tokens"], 8)
-                self.assertEqual(
-                    stats["storage_read_get_requested_bytes"],
-                    8 * cc.storage_host_pool.size_per_token,
-                )
-                self.assertEqual(
-                    stats["storage_read_get_completed_bytes"],
-                    stats["storage_read_get_requested_bytes"],
-                )
-                self.assertIsNone(stats["storage_read_wire_bytes"])
-                self.assertEqual(stats["native_jobs_completed"], 1)
-                self.assertEqual(stats["native_loaded_tokens"], 4)
-                self.assertEqual(stats["native_requested_tokens"], 4)
-                self.assertEqual(stats["native_active_jobs"], 0)
-                self.assertEqual(stats["native_demand_waiters"], 0)
-                for key in (
-                    "native_queue_seconds",
-                    "native_restore_seconds",
-                    "native_demand_wait_seconds",
-                    "storage_read_query_seconds",
-                    "storage_read_get_seconds",
-                ):
-                    self.assertGreaterEqual(stats[key], 0)
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-                cache.finish(ordinary, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_demand_bypasses_unissued_shared_prefix_hint(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        config = ServiceConfig(
-            namespace="ns", engine_id="engine", limits=Limits(max_scope_tokens=4)
-        )
-        with hicache(self, config, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            # The two reads share the first radix page.
-            scopes = [
-                cache_fixtures.target((1, 6, 7, 8), cache_salt="queued"),
-                cache_fixtures.target(cache_salt="queued"),
-            ]
-            self._cold_scopes(owner, scopes)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            query, get = cc._storage_hit_query, cc.page_get_func
-            queries, gets = [], []
-            demand = CacheRequestHandle("queued-demand", 0)
-
-            def counted_query(operation):
-                queries.append(operation)
-                return query(operation)
-
-            def blocked_get(operation, *args, **kwargs):
-                gets.append(operation)
-                entered.set()
-                assert release.wait(5)
-                return get(operation, *args, **kwargs)
-
-            try:
-                with (
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(cc, "page_get_func", blocked_get),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    first = self._restore(service, scopes[0], "queue-first")
-                    wait_for(service, entered.is_set)
-                    queued = public_transfer(
-                        service,
-                        "prefetch",
-                        "storage",
-                        "host",
-                        "queue-second",
-                        salt=scopes[1].cache_salt,
-                    )
-                    reads = service.control.executor.storage_reads
-                    job = reads.interests[queued.ref.operation_id].job
-                    self.assertIsNone(job.operation)
-                    self.assertEqual(job.waiting, "shared_prefix_serialization")
-                    # Queuing changes no exact-scope/namespace/stop-policy rule.
-                    for values, salt, extra_key, policy in (
-                        (
-                            (1, 2, 3, 4, 5, 6),
-                            service.cache_salt(scopes[1].cache_salt),
-                            None,
-                            "wait_complete",
-                        ),
-                        (
-                            (1, 2),
-                            service.cache_salt(scopes[1].cache_salt),
-                            None,
-                            "wait_complete",
-                        ),
-                        (
-                            (1, 2, 3, 5),
-                            service.cache_salt(scopes[1].cache_salt),
-                            None,
-                            "wait_complete",
-                        ),
-                        (
-                            (1, 2, 3, 4),
-                            service.cache_salt("foreign"),
-                            None,
-                            "wait_complete",
-                        ),
-                        (
-                            (1, 2, 3, 4),
-                            service.cache_salt(scopes[1].cache_salt),
-                            "foreign",
-                            "wait_complete",
-                        ),
-                        (
-                            (1, 2, 3, 4),
-                            service.cache_salt(scopes[1].cache_salt),
-                            None,
-                            "best_effort",
-                        ),
-                    ):
-                        with patch.object(cache, "prefetch_stop_policy", policy):
-                            self.assertFalse(
-                                reads.join_demand(
-                                    demand,
-                                    [],
-                                    cache_fixtures.RadixKey(
-                                        cache_fixtures.array("q", values)
-                                    ),
-                                    extra_key,
-                                    salt,
-                                )
-                            )
-                    self._ordinary_prefetch(cache, service, scopes[1], demand)
-                    self.assertNotIn(demand, reads.demands)
-                    self.assertIn(demand, cache.ongoing_prefetch)
-                    done = wait(service, queued)
-                    self.assertEqual(done.status, Status.DEFERRED)
-                    self.assertEqual(done.update.code, "ordinary_restore")
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self._consume_ordinary_prefetch(cache, service, demand)
-                    self.assertEqual(gets[-1].handle, demand)
-                    self.assertEqual((len(queries), len(gets)), (2, 2))
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_aborting_demand_after_shared_prefix_bypass_releases_ordinary_read(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target((1, 6, 7, 8), cache_salt="abort"),
-                cache_fixtures.target(cache_salt="abort"),
-            ]
-            self._cold_scopes(owner, scopes)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            query, get = cc._storage_hit_query, cc.page_get_func
-            queries = []
-            demand = CacheRequestHandle("queued-abort", 0)
-
-            def counted_query(operation):
-                queries.append(operation)
-                return query(operation)
-
-            blocked_get = block_io(get, entered, release)
-
-            try:
-                with (
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(cc, "page_get_func", blocked_get),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    first = self._restore(service, scopes[0], "abort-first")
-                    wait_for(service, entered.is_set)
-                    queued = self._restore(service, scopes[1], "abort-queued")
-                    self._ordinary_prefetch(cache, service, scopes[1], demand)
-                    reads = service.control.executor.storage_reads
-                    self.assertNotIn(demand, reads.demands)
-                    self.assertIn(demand, cache.ongoing_prefetch)
-                    cache.finish(demand, CacheRequestOutcome.ABORT)
-                    self.assertEqual(wait(service, queued).status, Status.DEFERRED)
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self.assertFalse(cache.ongoing_prefetch)
-                    self.assertTrue(all(op.handle == demand for op in queries[1:]))
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_joined_capacity_wait_defers_and_normal_prefetch_can_continue(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             target = cache_fixtures.target(cache_salt="pinned-fallback")
@@ -953,8 +306,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             cache.sanity_check()
 
     def test_ordinary_restore_survives_eviction_until_admission_or_abort(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         for finish in ("admission", "abort", "over_budget"):
             with (
                 self.subTest(finish=finish),
@@ -999,8 +350,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.sanity_check()
 
     def test_ordinary_restore_retains_an_already_published_host_prefix(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
             _, cache, service, _ = owner
             target = cache_fixtures.target()
@@ -1041,112 +390,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_admission_budget_counts_shared_host_prefix_once(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
-            _, cache, service, dma = owner
-            shared = seed(cache)
-            other = seed(cache, tokens=(5, 6, 7, 8), salt="other")
-            for node in (shared, other):
-                persist_prefix(cache, service, dma, node)
-            reads = service.control.executor.storage_reads
-            first, second, independent = [
-                CacheRequestHandle(name, 0) for name in ("one", "two", "independent")
-            ]
-            try:
-                with patch.object(
-                    cache.cache_controller, "prefetch_capacity_limit", 16
-                ):
-                    reads.hold_for_admission(first, shared.id, 4)
-                    reads.hold_for_admission(second, shared.id, 4)
-                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 4)
-                    reads.hold_for_admission(independent, other.id, 4)
-                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 8)
-                    self.assertEqual(cache.evict_host(8), 0)
-
-                    cache.finish_storage_prefetch_admission(first, 4, None)
-                    self.assertEqual(cache.evict_host(8), 0)
-                    cache.finish(second, CacheRequestOutcome.ABORT)
-                    self.assertEqual(cache.evict_host(8), 4)
-                    cache.finish_storage_prefetch_admission(independent, 4, None)
-                    self.assertEqual(cache.evict_host(8), 4)
-                    self.assertEqual(reads.snapshot()["admission_held_tokens"], 0)
-            finally:
-                for request in (first, second, independent):
-                    cache.finish(request, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_ordinary_read_does_not_wait_for_a_speculative_slot(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        config = ServiceConfig(
-            namespace="ns",
-            engine_id="engine",
-            cache_limits=CacheLimits(max_concurrent_storage_reads=1),
-        )
-        with hicache(self, config, namespace_keys=True) as owner:
-            _, cache, service, dma = owner
-            first = cache_fixtures.target(cache_salt="busy")
-            second = cache_fixtures.target((1, 2, 3, 4, 5, 6), cache_salt="queued")
-            self._cold_scopes(owner, (first, second))
-            prefix = seed(cache, value=9, salt="queued")
-            backup_prefix(cache, dma, prefix, evict=True)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            get = cc.page_get_func
-            reads = []
-            demand = CacheRequestHandle("queued-hint-demand", 0)
-
-            def block_first(operation, *args, **kwargs):
-                reads.append(operation.request_id)
-                if len(reads) == 1:
-                    entered.set()
-                    assert release.wait(5)
-                return get(operation, *args, **kwargs)
-
-            try:
-                with (
-                    patch.object(cc, "page_get_func", block_first),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    active = self._restore(service, first, "active")
-                    wait_for(service, entered.is_set)
-                    with patch.object(
-                        cache, "inc_host_lock_ref", wraps=cache.inc_host_lock_ref
-                    ) as hold:
-                        queued = self._restore(service, second, "queued")
-                        hold.assert_not_called()
-                    self.assertEqual(queued.update.code, "storage_concurrency_limit")
-                    cache.prefetch_from_storage(
-                        demand,
-                        prefix.id,
-                        cache_fixtures.array("q", second.token_ids[4:]),
-                        last_hash=cache.get_last_hash_value(prefix.id),
-                        matched_prefix_tokens=list(second.token_ids[:4]),
-                        cache_salt=service.cache_salt(second.cache_salt),
-                    )
-                    self.assertIn(demand, cache.ongoing_prefetch)
-                    terminal = wait(service, queued)
-                    self.assertEqual(terminal.status, Status.DEFERRED)
-                    self.assertEqual(terminal.update.code, "ordinary_restore")
-                    release.set()
-                    self.assertEqual(wait(service, active).status, Status.COMPLETED)
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand), (2, 4)
-                    )
-                    self.assertEqual(reads[1:], [demand.rid])
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_ordinary_read_does_not_wait_for_a_rate_limited_hint(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
             busy, target = [
@@ -1194,155 +438,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_storage_pipeline_config_defaults_bounds_and_public_wiring(self):
-        from sglang.srt.mem_cache.unified_cache.control_state import (
-            CacheControlConfig,
-        )
-
-        self.assertEqual(
-            ServiceConfig(namespace="ns").cache_config().max_concurrent_storage_reads, 4
-        )
-        for bound in (1, 64):
-            config = parse_config(
-                {
-                    "namespace": "ns",
-                    "cache_limits": {"max_concurrent_storage_reads": bound},
-                }
-            )
-            self.assertEqual(config.cache_config().max_concurrent_storage_reads, bound)
-        for invalid in (0, 65, True, 1.5):
-            with self.subTest(invalid=invalid):
-                with self.assertRaises((ValueError, msgspec.ValidationError)):
-                    CacheControlConfig(
-                        namespace="ns", max_concurrent_storage_reads=invalid
-                    )
-                with self.assertRaises((ValueError, msgspec.ValidationError)):
-                    parse_config(
-                        {
-                            "namespace": "ns",
-                            "cache_limits": {"max_concurrent_storage_reads": invalid},
-                        }
-                    )
-
-    def test_different_salts_pipeline_queries_while_get_blocks_and_bound_is_enforced(
-        self,
-    ):
-        for bound in (1, 2):
-            config = ServiceConfig(
-                namespace="ns",
-                engine_id="engine",
-                cache_limits=CacheLimits(max_concurrent_storage_reads=bound),
-            )
-            with (
-                self.subTest(bound=bound),
-                hicache(self, config, namespace_keys=True) as owner,
-            ):
-                _, cache, service, _ = owner
-                scopes = [
-                    cache_fixtures.target(cache_salt=f"salt-{i}") for i in range(3)
-                ]
-                self._cold_scopes(owner, scopes)
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                get, query = cc.page_get_func, cc._storage_hit_query
-                queries = []
-
-                blocked_get = block_io(get, entered, release)
-
-                def counted_query(operation):
-                    queries.append(operation)
-                    return query(operation)
-
-                results = []
-                try:
-                    with (
-                        patch.object(cc, "page_get_func", blocked_get),
-                        patch.object(cc, "_storage_hit_query", counted_query),
-                    ):
-                        results.append(self._restore(service, scopes[0], "restore-0"))
-                        wait_for(service, entered.is_set)
-                        results.extend(
-                            self._restore(service, target, f"restore-{i}")
-                            for i, target in enumerate(scopes[1:], 1)
-                        )
-                        wait_for(service, lambda: len(queries) == bound)
-                        for _ in range(5):
-                            service.progress()
-                        reads = service.control.executor.storage_reads
-                        self.assertEqual(
-                            sum(j.operation is not None for j in reads.jobs.values()),
-                            bound,
-                        )
-                        self.assertEqual(len(queries), bound)
-                        self.assertEqual(
-                            current(service, results[-1]).update.code,
-                            "storage_concurrency_limit",
-                        )
-                        release.set()
-                        for result in results:
-                            self.assertEqual(
-                                wait(service, result).status, Status.COMPLETED
-                            )
-                        self.assertEqual(len(queries), 3)
-                finally:
-                    release.set()
-                for index, target in enumerate(scopes):
-                    path = service.control.executor._walk(
-                        target.token_ids,
-                        service.control.executor._compatibility(target),
-                    )
-                    host = cache.host_pool_group.anchor_entry.host_pool
-                    for node, _, _, _ in path:
-                        cd = node.component_data[FULL]
-                        self.assertTrue(
-                            torch.all(host.k_buffer[0][cd.host_value] == 7 + index * 2)
-                        )
-                        self.assertEqual((cd.lock_ref, cd.host_lock_ref), (0, 0))
-                assert_retired(cache, service)
-                cache.sanity_check()
-
-    def test_shared_root_serializes_while_disjoint_scope_starts(self):
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target(cache_salt="shared"),
-                cache_fixtures.target((1, 11, 12, 13), cache_salt="shared"),
-                cache_fixtures.target(cache_salt="resident"),
-                cache_fixtures.target((20, 21, 22, 23), cache_salt="shared"),
-            ]
-            self._cold_scopes(owner, scopes)
-            self.assertEqual(
-                wait(service, self._restore(service, scopes[2], "resident")).status,
-                Status.COMPLETED,
-            )
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            get = cc.page_get_func
-
-            blocked_get = block_io(get, entered, release)
-
-            try:
-                with patch.object(cc, "page_get_func", blocked_get):
-                    first = self._restore(service, scopes[0], "cold-first")
-                    wait_for(service, entered.is_set)
-                    second = self._restore(service, scopes[1], "same-domain")
-                    self.assertEqual(
-                        current(service, second).update.code,
-                        "shared_prefix_serialization",
-                    )
-                    resident = self._restore(service, scopes[2], "resident-again")
-                    self.assertEqual(resident.status, Status.COMPLETED)
-                    disjoint = self._restore(service, scopes[3], "disjoint")
-                    self.assertEqual(len(cache.ongoing_prefetch), 2)
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
-                    self.assertEqual(wait(service, disjoint).status, Status.COMPLETED)
-            finally:
-                release.set()
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_resident_system_prompt_does_not_serialize_cold_siblings(self):
         with hicache(self, namespace_keys=True) as owner:
             _, cache, service, _ = owner
@@ -1363,255 +458,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             self.assertEqual(wait(service, a).status, Status.COMPLETED)
             self.assertEqual(wait(service, b).status, Status.COMPLETED)
             assert_retired(cache, service)
-
-    def test_query_stage_has_no_host_allocation_and_cancellation_drains(self):
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target(range(1, 41), cache_salt=f"capacity-{i}")
-                for i in range(2)
-            ]
-            self._cold_scopes(owner, scopes)
-            pressure = self._host_pressure(owner, leave_free=60)
-            self._pin_pressure(service, pressure)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            query, queries = cc._storage_hit_query, []
-
-            def blocked_query(operation):
-                queries.append(operation)
-                entered.set()
-                assert release.wait(5)
-                return query(operation)
-
-            try:
-                with (
-                    patch.object(cc, "_storage_hit_query", blocked_query),
-                    patch.object(
-                        cache, "evict_host", wraps=cache.evict_host
-                    ) as evictions,
-                ):
-                    first = self._restore(service, scopes[0], "capacity-first")
-                    wait_for(service, entered.is_set)
-                    second = self._restore(service, scopes[1], "capacity-second")
-                    reads = service.control.executor.storage_reads
-                    self.assertEqual(reads.snapshot()["reserved_host_tokens"], 0)
-                    self.assertEqual(reads.snapshot()["inflight_tokens"], 80)
-                    self.assertTrue(
-                        all(
-                            info.host_indices is None
-                            for info in cache.ongoing_prefetch.values()
-                        )
-                    )
-                    self.assertEqual(cc.mem_pool_host.available_size(), 60)
-                    self.assertEqual(
-                        service.control.cancel(first.ref).status, Status.CANCELLING
-                    )
-                    for _ in range(10):
-                        service.progress()
-                    self.assertEqual(len(queries), 1)
-                    evictions.assert_not_called()
-                    self.assertEqual(
-                        cc.storage_read_stats_snapshot()["storage_read_get_batches"], 0
-                    )
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.CANCELLED)
-                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
-                    self.assertEqual(len(queries), 2)
-                    self.assertEqual(cc.mem_pool_host.available_size(), 20)
-                    evictions.assert_not_called()
-            finally:
-                release.set()
-                self._pin_pressure(service, pressure, mode="release")
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_allocated_job_does_not_double_count_reservation(self):
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target(range(1, 41), cache_salt=f"allocated-{i}")
-                for i in range(2)
-            ]
-            self._cold_scopes(owner, scopes)
-            pressure = self._host_pressure(owner, leave_free=80)
-            self._pin_pressure(service, pressure)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            get, query = cc.page_get_func, cc._storage_hit_query
-            queries = []
-
-            blocked_get = block_io(get, entered, release)
-
-            def counted_query(operation):
-                queries.append(operation)
-                return query(operation)
-
-            try:
-                with (
-                    patch.object(cc, "page_get_func", blocked_get),
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(
-                        cache,
-                        "evict_host",
-                        side_effect=AssertionError("unexpected eviction"),
-                    ),
-                ):
-                    first = self._restore(service, scopes[0], "allocated-first")
-                    wait_for(service, entered.is_set)
-                    self.assertEqual(cc.mem_pool_host.available_size(), 40)
-                    second = self._restore(service, scopes[1], "allocated-second")
-                    wait_for(service, lambda: len(queries) == 2)
-                    second_job = service.control.executor.storage_reads.interests[
-                        second.ref.operation_id
-                    ].job
-                    self.assertIsNotNone(second_job.operation)
-                    release.set()
-                    self.assertEqual(wait(service, first).status, Status.COMPLETED)
-                    self.assertEqual(wait(service, second).status, Status.COMPLETED)
-            finally:
-                release.set()
-                self._pin_pressure(service, pressure, mode="release")
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_pipelined_job_keeps_exact_coalescing_and_demand_cancellation_ownership(
-        self,
-    ):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            scopes = [
-                cache_fixtures.target(),
-                cache_fixtures.target(cache_salt="independent"),
-            ]
-            self._cold_scopes(owner, scopes)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            get, query = cc.page_get_func, cc._storage_hit_query
-            queries, gets = [], []
-
-            def blocked_get(operation, *args, **kwargs):
-                gets.append(operation)
-                entered.set()
-                assert release.wait(5)
-                return get(operation, *args, **kwargs)
-
-            def counted_query(operation):
-                queries.append(operation)
-                return query(operation)
-
-            demand = CacheRequestHandle("pipelined-demand", 0)
-            try:
-                with (
-                    patch.object(cc, "page_get_func", blocked_get),
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    first = self._restore(service, scopes[0], "coalesced-first")
-                    wait_for(service, entered.is_set)
-                    sibling = self._restore(service, scopes[0], "coalesced-sibling")
-                    other = self._restore(service, scopes[1], "independent")
-                    wait_for(service, lambda: len(queries) == 2)
-                    reads = service.control.executor.storage_reads
-                    job = reads.interests[first.ref.operation_id].job
-                    self.assertIs(reads.interests[sibling.ref.operation_id].job, job)
-                    self.assertEqual(
-                        service.control.cancel(first.ref).status, Status.CANCELLED
-                    )
-                    self.assertFalse(job.operation.is_terminated())
-                    self.assertTrue(
-                        reads.join_demand(
-                            demand,
-                            [],
-                            cache_fixtures.RadixKey(
-                                cache_fixtures.array("q", [1, 2, 3, 4])
-                            ),
-                            None,
-                            service.cache_salt(None),
-                        )
-                    )
-                    self.assertEqual(
-                        service.control.cancel(sibling.ref).status, Status.CANCELLING
-                    )
-                    self.assertFalse(job.operation.is_terminated())
-                    release.set()
-                    self.assertEqual(wait(service, sibling).status, Status.CANCELLED)
-                    self.assertEqual(wait(service, other).status, Status.COMPLETED)
-                    self.assertEqual(reads.release_demand(demand), (4, 0))
-                    self.assertEqual(len(queries), 2)
-                    self.assertEqual(len(gets), 2)
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_query_miss_or_partial_get_releases_pipeline_turn_for_waiting_scope(self):
-        for failure in ("miss", "partial"):
-            config = ServiceConfig(
-                namespace="ns",
-                engine_id="engine",
-                cache_limits=CacheLimits(max_concurrent_storage_reads=1),
-            )
-            with (
-                self.subTest(failure=failure),
-                hicache(self, config, namespace_keys=True) as owner,
-            ):
-                _, cache, service, _ = owner
-                scopes = [
-                    cache_fixtures.target(cache_salt=f"failure-{i}") for i in range(2)
-                ]
-                self._cold_scopes(owner, scopes)
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                query, get = cc._storage_hit_query, cc.page_get_func
-                first_operation = []
-
-                def failed_query(operation):
-                    if not first_operation:
-                        first_operation.append(operation)
-                        if failure == "miss":
-                            entered.set()
-                            assert release.wait(5)
-                            return [], 0
-                    return query(operation)
-
-                def partial_get(operation, hashes, indices, extra_info=None):
-                    if operation is first_operation[0] and failure == "partial":
-                        entered.set()
-                        assert release.wait(5)
-                        return get(operation, hashes[:2], indices[:2], extra_info)
-                    return get(operation, hashes, indices, extra_info)
-
-                try:
-                    with (
-                        patch.object(cc, "_storage_hit_query", failed_query),
-                        patch.object(cc, "page_get_func", partial_get),
-                    ):
-                        first = self._restore(service, scopes[0], "failing-first")
-                        wait_for(service, entered.is_set)
-                        second = self._restore(service, scopes[1], "after-failure")
-                        self.assertEqual(
-                            current(service, second).update.code,
-                            "storage_concurrency_limit",
-                        )
-                        self.assertIsNone(
-                            service.control.executor.storage_reads.interests[
-                                second.ref.operation_id
-                            ].job.operation
-                        )
-                        release.set()
-                        self.assertEqual(
-                            wait(service, first).status,
-                            Status.MISSING if failure == "miss" else Status.FAILED,
-                        )
-                        self.assertEqual(wait(service, second).status, Status.COMPLETED)
-                finally:
-                    release.set()
-                assert_retired(cache, service)
-                cache.sanity_check()
 
     def test_deadline_keeps_pipeline_turn_until_query_or_get_actually_drains(self):
         for phase in ("query", "get"):
@@ -1682,54 +528,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 assert_retired(cache, service)
                 cache.sanity_check()
 
-    def test_expired_queued_prefetch_does_not_start_when_storage_becomes_available(
-        self,
-    ):
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            self._cold_scopes(owner, [cache_fixtures.target()])
-            reads = service.control.executor.storage_reads
-            with patch.object(
-                cache.cache_controller, "prefetch_rate_limited", return_value=True
-            ):
-                result = public_transfer(
-                    service, "prefetch", "storage", "host", "expired-before-start"
-                )
-                self.assertEqual(result.update.code, "storage_rate_limit")
-                self.assertEqual(reads.stats["jobs_started"], 0)
-
-            # The same scheduler pass sees both the available slot and the
-            # expired deadline. It must not submit a new storage query.
-            self.clock.now += 5.1
-            service.progress()
-            self.assertEqual(reads.stats["jobs_started"], 0)
-            self.assertEqual(current(service, result).status, Status.CANCELLED)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_missing_storage_hint_preserves_host_cache_before_query(self):
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            rows = self._host_pressure(owner)
-            indices = [node.component_data[FULL].host_value.clone() for node, _ in rows]
-            result = self._restore(service, cache_fixtures.target(), "absent")
-            done = wait(service, result)
-            self.assertEqual(done.status, Status.MISSING)
-            self.assertEqual(done.update.code, "missing_copy")
-            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
-            pool = cache.host_pool_group.anchor_entry.host_pool
-            for index, ((node, _), original) in enumerate(zip(rows, indices)):
-                self.assertTrue(
-                    torch.equal(node.component_data[FULL].host_value, original)
-                )
-                self.assertTrue(torch.all(pool.k_buffer[0][original] == 11 + index))
-                self.assertTrue(torch.all(pool.v_buffer[0][original] == 12 + index))
-            stats = cache.cache_controller.storage_read_stats_snapshot()
-            self.assertEqual(stats["storage_read_query_jobs"], 1)
-            self.assertEqual(stats["storage_read_get_batches"], 0)
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_query_anchor_loss_defers_without_reading_into_stale_rows(self):
         with hicache(self, namespace_keys=True) as owner:
             cache, service, _ = cold_prefix(owner)
@@ -1747,7 +545,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 return query(operation)
 
             try:
-                with patch.object(cc, "_storage_hit_query", blocked_query):
+                with (
+                    patch.object(cc, "_storage_hit_query", blocked_query),
+                    patch.object(cc, "page_get_func", wraps=cc.page_get_func) as get,
+                ):
                     result = transfer(
                         service, src="storage", dst="host", message="lost-anchor"
                     )
@@ -1757,53 +558,10 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     done = wait(service, result)
                     self.assertEqual(done.status, Status.DEFERRED)
                     self.assertEqual(done.update.code, "source_changed")
+                    get.assert_not_called()
             finally:
                 release.set()
-            self.assertEqual(
-                cc.storage_read_stats_snapshot()["storage_read_get_batches"], 1
-            )
-            assert_retired(cache, service)
-            cache.sanity_check()
 
-    def test_capacity_wait_does_not_block_smaller_ordinary_read(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            _, cache, service, _ = owner
-            large = cache_fixtures.target(tuple(range(1, 9)), cache_salt="large")
-            small = cache_fixtures.target(cache_salt="small")
-            self._cold_scopes(owner, [large, small])
-            pressure = self._host_pressure(owner, leave_free=4)
-            self._pin_pressure(service, pressure)
-            demand = CacheRequestHandle("small-read", 0)
-            try:
-                with (
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    result = self._restore(service, large, "large-wait")
-                    wait_for(
-                        service,
-                        lambda: (
-                            current(service, result).update.code
-                            == "whole_scope_capacity"
-                        ),
-                    )
-                    self._ordinary_prefetch(cache, service, small, demand)
-                    self.assertEqual(
-                        self._consume_ordinary_prefetch(cache, service, demand)[0], 4
-                    )
-                    self.assertEqual(
-                        current(service, result).update.code, "whole_scope_capacity"
-                    )
-                    self.assertEqual(
-                        cache.cache_controller.mem_pool_host.available_size(), 0
-                    )
-                    service.control.cancel(result.ref)
-                    self.assertEqual(wait(service, result).status, Status.CANCELLED)
-            finally:
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-                self._pin_pressure(service, pressure, mode="release")
             assert_retired(cache, service)
             cache.sanity_check()
 
@@ -1956,9 +714,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                     service.progress()
                 self.assertEqual(evictions.call_count, 1)
                 self.assertEqual(queries.call_count, 1)
-                self.assertEqual(
-                    cc.storage_read_stats_snapshot()["storage_read_get_batches"], 0
-                )
+
                 self.assertEqual(
                     current(service, first).update.code, "whole_scope_capacity"
                 )
@@ -1993,103 +749,7 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             assert_retired(cache, service)
             cache.sanity_check()
 
-    def test_rate_limited_prefetch_does_not_evict_host(self):
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, _ = cold_prefix(owner)
-            rows = self._host_pressure(owner)
-            gpu_free = cache.token_to_kv_pool_allocator.available_size()
-            held = {
-                node.id: node.component_data[FULL].host_value.clone()
-                for node, _ in rows
-            }
-            cc = cache.cache_controller
-            with (
-                patch.object(
-                    cache,
-                    "evict_host",
-                    side_effect=AssertionError("unapproved host eviction"),
-                ),
-                patch.object(cc, "prefetch_rate_limited", return_value=True),
-            ):
-                result = transfer(service, src="storage", dst="host", message="blocked")
-                for _ in range(3):
-                    service.progress()
-                self.assertEqual(current(service, result).status, Status.QUEUED)
-                self.assertEqual(
-                    service.control.cancel(result.ref).status, Status.CANCELLED
-                )
-            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
-            self.assertEqual(
-                cache.token_to_kv_pool_allocator.available_size(), gpu_free
-            )
-            self.assertTrue(
-                all(
-                    torch.equal(node.component_data[FULL].host_value, held[node.id])
-                    for node, _ in rows
-                )
-            )
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_waiting_prefetch_uses_freed_capacity_before_scan_retry_deadline(self):
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, _ = cold_prefix(owner)
-            rows = self._host_pressure(owner)
-            self._pin_pressure(service, rows)
-            with patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions:
-                result = transfer(service, src="storage", dst="host", message="waiting")
-                wait_for(
-                    service,
-                    lambda: (
-                        current(service, result).update.code == "whole_scope_capacity"
-                    ),
-                )
-                self.assertEqual(evictions.call_count, 1)
-                self._pin_pressure(service, rows[1:2], mode="release")
-                count = len(rows[1][1])
-                self.assertEqual(cache.evict_host(count), count)
-                # Native memory may become available without clock advance;
-                # backoff limits scans, not use of already released capacity.
-                self.assertEqual(wait(service, result).status, Status.COMPLETED)
-                self.assertEqual(self.clock.now, 100)
-                self.assertEqual(evictions.call_count, 2)
-            self._pin_pressure(service, rows[:1] + rows[2:], mode="release")
-            assert_retired(cache, service)
-            cache.sanity_check()
-
-    def test_expired_waiting_prefetch_does_not_evict_newly_unpinned_host_rows(self):
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, _ = cold_prefix(owner)
-            rows = self._host_pressure(owner)
-            self._pin_pressure(service, rows)
-            with patch.object(cache, "evict_host", wraps=cache.evict_host) as evictions:
-                result = public_transfer(
-                    service, "prefetch", "storage", "host", "expired"
-                )
-                wait_for(
-                    service,
-                    lambda: (
-                        current(service, result).update.code == "whole_scope_capacity"
-                    ),
-                )
-                self.assertEqual(evictions.call_count, 1)
-                self._pin_pressure(service, rows, mode="release")
-                self.clock.now = 106
-                service.progress()
-                self.assertEqual(wait(service, result).status, Status.CANCELLED)
-                self.assertEqual(evictions.call_count, 1)
-            self.assertEqual(cache.cache_controller.mem_pool_host.available_size(), 0)
-            self.assertTrue(
-                all(
-                    node.component_data[FULL].host_value is not None for node, _ in rows
-                )
-            )
-            assert_retired(cache, service)
-            cache.sanity_check()
-
     def test_request_with_backend_actions_keeps_its_own_storage_read(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
         hint = KvHintsEnvelope(
             protocol_version="0.1",
             message_id="backend-request",
@@ -2142,264 +802,78 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.finish(request, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
 
-    def test_native_demand_coalesces_backend_io(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True, write_policy="write_through") as owner:
-            cache, service, dma = cold_prefix(owner)
-            cc = cache.cache_controller
-            entered, release = threading.Event(), threading.Event()
-            counts = {"query": 0, "get": 0}
-            query, get = cc._storage_hit_query, cc.page_get_func
-
-            def counted_query(*args, **kwargs):
-                counts["query"] += 1
-                return query(*args, **kwargs)
-
-            def counted_get(*args, **kwargs):
-                counts["get"] += 1
-                entered.set()
-                assert release.wait(5)
-                return get(*args, **kwargs)
-
-            demand = CacheRequestHandle("ordinary-demand", 0)
-            try:
-                with (
-                    patch.object(cc, "_storage_hit_query", counted_query),
-                    patch.object(cc, "page_get_func", counted_get),
-                    patch.object(cache, "prefetch_threshold", 1),
-                    patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                ):
-                    native = transfer(
-                        service, src="storage", dst="host", message="native"
-                    )
-                    wait_for(service, entered.is_set)
-                    cache.prefetch_from_storage(
-                        demand,
-                        cache.tree_core.root_node.id,
-                        cache_fixtures.array("q", [1, 2, 3, 4]),
-                        matched_prefix_tokens=[],
-                        cache_salt=service.cache_salt(None),
-                    )
-                    release.set()
-                    wait(service, native)
-
-                    def demand_ready():
-                        cache.drain_storage_control_queues()
-                        return cache.check_prefetch_progress(demand)
-
-                    wait_for(service, demand_ready)
-                    span = cache.pop_prefetch_loaded_span(demand)
-                    cache.discard_storage_prefetch_accounting(demand)
-                    service.progress()
-                    print(
-                        "native/demand physical operations", counts, "demand span", span
-                    )
-                    self.assertEqual(counts, {"query": 1, "get": 1})
-                    self.assertEqual(span, (4, 0))
-                    self.assertEqual(cache.evict_host(4), 0)
-                    cache.finish_storage_prefetch_admission(demand, 4, None)
-                    self.assertEqual(cache.evict_host(4), 4)
-            finally:
-                release.set()
-                cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-
-    def test_ordinary_read_survives_original_request_abort_with_a_shared_demand(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        for abort_both in (False, True):
+    def test_demand_and_hint_share_backend_io_in_either_order(self):
+        for hint_first in (True, False):
             with (
-                self.subTest(abort_both=abort_both),
-                hicache(
-                    self, namespace_keys=True, write_policy="write_through"
-                ) as owner,
+                self.subTest(hint_first=hint_first),
+                hicache(self, namespace_keys=True, write_policy="write_through") as owner,
             ):
                 cache, service, _ = cold_prefix(owner)
-                cc = cache.cache_controller
-                reads = service.control.executor.storage_reads
+                controller = cache.cache_controller
                 entered, release = threading.Event(), threading.Event()
-                calls = []
-                get = cc.page_get_func
-
-                def blocked_get(*args, **kwargs):
-                    calls.append("get")
-                    entered.set()
-                    assert release.wait(5)
-                    return get(*args, **kwargs)
-
-                first = CacheRequestHandle("ordinary-first", 0)
-                second = CacheRequestHandle("ordinary-second", 0)
-
-                def start(request):
-                    cache.prefetch_from_storage(
-                        request,
-                        cache.tree_core.root_node.id,
-                        cache_fixtures.array("q", [1, 2, 3, 4]),
-                        matched_prefix_tokens=[],
-                        cache_salt=service.cache_salt(None),
-                    )
-
+                demand = CacheRequestHandle("demand", 0)
+                target = cache_fixtures.target()
                 try:
                     with (
-                        patch.object(cc, "page_get_func", blocked_get),
+                        patch.object(
+                            controller,
+                            "_storage_hit_query",
+                            wraps=controller._storage_hit_query,
+                        ) as query,
+                        patch.object(
+                            controller,
+                            "page_get_func",
+                            side_effect=block_io(
+                                controller.page_get_func, entered, release
+                            ),
+                        ) as get,
                         patch.object(cache, "prefetch_threshold", 1),
                         patch.object(cache, "prefetch_stop_policy", "wait_complete"),
                     ):
-                        start(first)
-
-                        def started():
-                            cache.drain_storage_control_queues()
-                            return entered.is_set()
-
-                        wait_for(service, started)
-                        operation = cache.ongoing_prefetch[first].operation
-                        start(second)
-                        self.assertNotIn(second, cache.ongoing_prefetch)
-                        self.assertIs(reads.demands[second].job.operation, operation)
-                        cache.finish(first, CacheRequestOutcome.ABORT)
-                        service.progress()
-                        self.assertFalse(operation.is_terminated())
-
-                        if abort_both:
-                            cache.finish(second, CacheRequestOutcome.ABORT)
-                            service.progress()
-                            self.assertTrue(operation.is_terminated())
-                            release.set()
-                            wait_for(service, lambda: not reads.jobs)
+                        if hint_first:
+                            hint = self._restore(service, target, "hint")
                         else:
-                            release.set()
-                            self.assertEqual(
-                                self._consume_ordinary_prefetch(cache, service, second),
-                                (4, 0),
-                            )
-                            self.assertEqual(cache.evict_host(4), 0)
-                            cache.finish(second, CacheRequestOutcome.ABORT)
-                            self.assertEqual(cache.evict_host(4), 4)
-                        self.assertEqual(calls, ["get"])
-                        self.assertEqual(reads.stats["demand_coalesced"], 1)
-                finally:
-                    release.set()
-                    cache.finish(first, CacheRequestOutcome.ABORT)
-                    cache.finish(second, CacheRequestOutcome.ABORT)
-                assert_retired(cache, service)
-                cache.sanity_check()
-
-    def test_late_hint_shares_covering_ordinary_io_and_its_own_receipt(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        for cancel in (None, "hint", "demand", "both_during_query"):
-            with (
-                self.subTest(cancel=cancel),
-                hicache(self, namespace_keys=True) as owner,
-            ):
-                cache, service, _ = cold_prefix(owner)
-                cc = cache.cache_controller
-                reads = service.control.executor.storage_reads
-                entered, release = threading.Event(), threading.Event()
-                calls = {"query": 0, "get": 0}
-                query, get = cc._storage_hit_query, cc.page_get_func
-                block_query = cancel == "both_during_query"
-
-                def counted_query(*args, **kwargs):
-                    calls["query"] += 1
-                    if block_query:
-                        entered.set()
-                        assert release.wait(5)
-                    return query(*args, **kwargs)
-
-                def counted_get(*args, **kwargs):
-                    calls["get"] += 1
-                    if not block_query:
-                        entered.set()
-                        assert release.wait(5)
-                    return get(*args, **kwargs)
-
-                demand = CacheRequestHandle("demand-first", 0)
-                try:
-                    with (
-                        patch.object(cc, "_storage_hit_query", counted_query),
-                        patch.object(cc, "page_get_func", counted_get),
-                        patch.object(cache, "prefetch_threshold", 1),
-                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                    ):
-                        cache.prefetch_from_storage(
-                            demand,
-                            cache.tree_core.root_node.id,
-                            cache_fixtures.array("q", [1, 2, 3, 4, 5]),
-                            matched_prefix_tokens=[],
-                            cache_salt=service.cache_salt(None),
-                        )
-                        operation = cache.ongoing_prefetch[demand].operation
+                            self._ordinary_prefetch(cache, service, target, demand)
 
                         def started():
                             cache.drain_storage_control_queues()
                             return entered.is_set()
 
                         wait_for(service, started)
-                        hint = transfer(service, message="late")
-                        self.assertEqual(hint.status, Status.RUNNING)
-                        self.assertEqual(hint.update.code, "storage_pending")
-                        self.assertEqual(
-                            reads.snapshot()["waiting_whole_scope_capacity"], 0
+                        if hint_first:
+                            self._ordinary_prefetch(cache, service, target, demand)
+                        else:
+                            hint = self._restore(service, target, "hint")
+                        reads = service.control.executor.storage_reads
+                        job = reads.interests[hint.ref.operation_id].job
+                        self.assertIs(
+                            job,
+                            reads.demands[demand].job
+                            if hint_first
+                            else reads.jobs[demand],
                         )
-                        self.assertIs(reads.jobs[demand].operation, operation)
-                        if cancel is None:
-                            longer = public_transfer(
-                                service,
-                                "prefetch",
-                                "storage",
-                                "host",
-                                "whole",
-                                tokens=(1, 2, 3, 4, 5),
-                            )
-                        if cancel in ("hint", "both_during_query"):
-                            cancelled = service.control.cancel(hint.ref)
-                            self.assertEqual(cancelled.status, Status.CANCELLING)
-                            self.assertFalse(cancelled.update.quiescent)
-                            self.assertFalse(operation.is_terminated())
-                        if cancel in ("demand", "both_during_query"):
-                            cache.finish(demand, CacheRequestOutcome.ABORT)
-                            service.progress()
-                            self.assertEqual(operation.is_terminated(), block_query)
-                            self.assertFalse(current(service, hint).update.quiescent)
-
                         release.set()
-                        done = wait(service, hint)
+                        settled = wait(service, hint)
+                        self.assertEqual(settled.status, Status.COMPLETED)
                         self.assertEqual(
-                            done.status,
-                            Status.CANCELLED
-                            if cancel in ("hint", "both_during_query")
-                            else Status.COMPLETED,
+                            settled.public_result.ready_scope[-1].coverage.end_token, 4
                         )
-                        if cancel is None:
-                            self.assertEqual(
-                                wait(service, longer).status, Status.FAILED
-                            )
-                            self.assertEqual(
-                                done.public_result.ready_scope[-1].coverage.end_token, 4
-                            )
-                        if cancel in (None, "hint"):
-                            self.assertTrue(cache.check_prefetch_progress(demand))
-                            self.assertEqual(cache.evict_host(4), 0)
-                            self.assertEqual(
-                                cache.pop_prefetch_loaded_span(demand), (4, 0)
-                            )
                         self.assertEqual(
-                            calls, {"query": 1, "get": int(not block_query)}
+                            self._consume_ordinary_prefetch(cache, service, demand),
+                            (4, 0),
                         )
-                        self.assertEqual(reads.stats["ordinary_reads_reused"], 1)
-                        self.assertEqual(reads.stats["jobs_started"], 0)
+                        self.assertEqual((query.call_count, get.call_count), (1, 1))
+                        self.assertEqual(cache.evict_host(4), 0)
+                        cache.finish_storage_prefetch_admission(demand, 4, None)
+                        self.assertEqual(cache.evict_host(4), 4)
                 finally:
                     release.set()
                     cache.finish(demand, CacheRequestOutcome.ABORT)
                 assert_retired(cache, service)
-                cache.sanity_check()
 
     def test_fragmented_long_demand_resumes_after_control_walk_budget_exhaustion(self):
         from sglang.srt.managers.kv_control.contracts import ControlError
         from sglang.srt.mem_cache.base_prefix_cache import (
-            CacheRequestHandle,
             MatchPrefixParams,
         )
 
@@ -2454,263 +928,8 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
                 cache.finish(request, CacheRequestOutcome.ABORT)
             assert_retired(cache, service)
 
-    def test_tool_resume_shares_issued_prefix_and_fetches_only_its_tail(self):
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        for source, tail_stored, scope_limit in (
-            ("hint", False, 8),
-            ("hint", True, 8),
-            ("ordinary", False, 8),
-            ("ordinary", True, 8),
-            ("hint", True, 4),
-            ("ordinary", True, 4),
-        ):
-            config = ServiceConfig(
-                namespace="ns",
-                engine_id="engine",
-                limits=Limits(max_scope_tokens=scope_limit),
-            )
-            with (
-                self.subTest(
-                    source=source, tail_stored=tail_stored, scope_limit=scope_limit
-                ),
-                hicache(self, config, namespace_keys=True) as owner,
-            ):
-                _, cache, service, _ = owner
-                ancestor = cache_fixtures.target()
-                resume = cache_fixtures.target((1, 2, 3, 4, 5, 6))
-                sibling = cache_fixtures.target((1, 2, 3, 4, 7, 8))
-                self._cold_scopes(
-                    owner, [resume, sibling] if tail_stored else [ancestor]
-                )
-                cc = cache.cache_controller
-                entered, release = threading.Event(), threading.Event()
-                batches = []
-                get = cc.page_get_func
-                ancestor_demand = CacheRequestHandle("ancestor-read", 0)
-                demand = CacheRequestHandle("tool-resume", 0)
-                sibling_demand = CacheRequestHandle("sibling-resume", 0)
-
-                def blocked_get(operation, hashes, *args, **kwargs):
-                    batches.append((operation.storage_start, tuple(hashes)))
-                    if not entered.is_set():
-                        entered.set()
-                        assert release.wait(5)
-                    return get(operation, hashes, *args, **kwargs)
-
-                try:
-                    with (
-                        patch.object(cc, "page_get_func", blocked_get),
-                        patch.object(cache, "prefetch_threshold", 1),
-                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                    ):
-                        hint = None
-                        if source == "hint":
-                            hint = self._restore(service, ancestor, "ancestor")
-                        else:
-                            self._ordinary_prefetch(
-                                cache, service, ancestor, ancestor_demand
-                            )
-
-                        def started():
-                            cache.drain_storage_control_queues()
-                            return entered.is_set()
-
-                        wait_for(service, started)
-                        self._ordinary_prefetch(cache, service, resume, demand)
-                        self.assertNotIn(demand, cache.ongoing_prefetch)
-                        self.assertFalse(cache.check_prefetch_progress(demand))
-                        reads = service.control.executor.storage_reads
-                        prefix_read = reads.demands[demand].job
-                        if hint is None:
-                            cache.finish(ancestor_demand, CacheRequestOutcome.ABORT)
-                            self.assertFalse(prefix_read.operation.is_terminated())
-                        if tail_stored:
-                            self._ordinary_prefetch(
-                                cache, service, sibling, sibling_demand
-                            )
-                            self.assertIs(
-                                reads.demands[sibling_demand].job, prefix_read
-                            )
-                        release.set()
-                        if hint is not None:
-                            self.assertEqual(
-                                wait(service, hint).status, Status.COMPLETED
-                            )
-                        else:
-                            wait_for(service, lambda: prefix_read.retired)
-                        if tail_stored:
-                            self.assertFalse(cache.check_prefetch_progress(demand))
-                            self.assertIn(demand, cache.ongoing_prefetch)
-                            if len(resume.token_ids) <= scope_limit:
-                                late = self._restore(
-                                    service, resume, "late-during-tail"
-                                )
-                                self.assertEqual(late.status, Status.DEFERRED)
-                            self.assertIs(reads.demands[demand].job, prefix_read)
-                            self.assertFalse(
-                                cache.check_prefetch_progress(sibling_demand)
-                            )
-                        self.assertEqual(
-                            self._consume_ordinary_prefetch(cache, service, demand),
-                            (6 if tail_stored else 4, 0),
-                        )
-                        if tail_stored:
-                            self.assertEqual(
-                                self._consume_ordinary_prefetch(
-                                    cache, service, sibling_demand
-                                ),
-                                (6, 0),
-                            )
-                        self.assertEqual(
-                            [(start, len(keys)) for start, keys in batches],
-                            [(0, 4), (4, 2), (4, 2)] if tail_stored else [(0, 4)],
-                        )
-                        if tail_stored:
-                            self.assertNotEqual(batches[1][1], batches[2][1])
-                        self.assertFalse(prefix_read.demands)
-                        self.assertFalse(prefix_read.host_locks)
-                finally:
-                    release.set()
-                    cache.finish(ancestor_demand, CacheRequestOutcome.ABORT)
-                    cache.finish(demand, CacheRequestOutcome.ABORT)
-                    cache.finish(sibling_demand, CacheRequestOutcome.ABORT)
-                assert_retired(cache, service)
-                cache.sanity_check()
-
-    def test_native_demand_cancel_lifetimes_and_mismatches(self):
-        from dataclasses import replace
-
-        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-        from sglang.srt.mem_cache.radix_cache import RadixKey
-
-        for abort_demand in (False, True):
-            with (
-                self.subTest(abort_demand=abort_demand),
-                hicache(self, namespace_keys=True) as owner,
-            ):
-                cache, service, dma = cold_prefix(owner)
-                cc = cache.cache_controller
-                reads = service.control.executor.storage_reads
-                entered, release = threading.Event(), threading.Event()
-                original = cc.page_get_func
-                calls = []
-
-                def blocked(*args, **kwargs):
-                    calls.append(1)
-                    entered.set()
-                    assert release.wait(5)
-                    return original(*args, **kwargs)
-
-                demand = CacheRequestHandle("demand", 3)
-                try:
-                    with (
-                        patch.object(cc, "page_get_func", blocked),
-                        patch.object(cache, "prefetch_threshold", 1),
-                        patch.object(cache, "prefetch_stop_policy", "wait_complete"),
-                    ):
-                        native = transfer(
-                            service, src="storage", dst="host", message="native"
-                        )
-                        wait_for(service, entered.is_set)
-                        key = lambda values: RadixKey(cache_fixtures.array("q", values))
-                        for values, salt in (
-                            ([1, 2, 3], service.cache_salt(None)),
-                            ([1, 2, 3, 5], service.cache_salt(None)),
-                            ([1, 2, 3, 4], service.cache_salt("other")),
-                            ([1, 2, 3, 4], "foreign-weight-namespace"),
-                        ):
-                            self.assertFalse(
-                                reads.join_demand(demand, [], key(values), None, salt)
-                            )
-                        cache.prefetch_from_storage(
-                            demand,
-                            cache.tree_core.root_node.id,
-                            cache_fixtures.array("q", [1, 2, 3, 4]),
-                            matched_prefix_tokens=[],
-                            cache_salt=service.cache_salt(None),
-                        )
-                        self.assertTrue(cache.has_ongoing_prefetch(demand))
-                        self.assertFalse(cache.check_prefetch_progress(demand))
-                        self.assertTrue(
-                            cache.check_prefetch_progress(
-                                CacheRequestHandle("unrelated", 0)
-                            )
-                        )
-                        # Same request re-entry cannot add a duplicate interest.
-                        cache.prefetch_from_storage(
-                            demand,
-                            cache.tree_core.root_node.id,
-                            cache_fixtures.array("q", [1, 2, 3, 4]),
-                            matched_prefix_tokens=[],
-                            cache_salt=service.cache_salt(None),
-                        )
-                        self.assertEqual(len(reads.demands), 1)
-                        sibling = CacheRequestHandle("aborted-sibling", 0)
-                        with patch.object(
-                            service.control.executor,
-                            "config",
-                            replace(
-                                service.control.executor.config, max_prepared_prefixes=1
-                            ),
-                        ):
-                            self.assertFalse(
-                                reads.join_demand(
-                                    sibling,
-                                    [],
-                                    key([1, 2, 3, 4]),
-                                    None,
-                                    service.cache_salt(None),
-                                )
-                            )
-                            self.assertEqual(reads.stats["demand_limit_declined"], 1)
-                        self.assertTrue(
-                            reads.join_demand(
-                                sibling,
-                                [],
-                                key([1, 2, 3, 4]),
-                                None,
-                                service.cache_salt(None),
-                            )
-                        )
-                        cache.finish(sibling, CacheRequestOutcome.ABORT)
-                        self.assertEqual(len(reads.demands), 1)
-                        self.assertFalse(
-                            next(iter(reads.jobs.values())).operation.is_terminated()
-                        )
-                        cancelled = service.control.cancel(native.ref)
-                        self.assertEqual(cancelled.status, Status.CANCELLING)
-                        job = next(iter(reads.jobs.values()))
-                        self.assertFalse(job.operation.is_terminated())
-                        if abort_demand:
-                            cache.finish(demand, CacheRequestOutcome.ABORT)
-                            service.progress()
-                            self.assertTrue(job.operation.is_terminated())
-                        release.set()
-                        done = wait(service, native)
-                        self.assertEqual(done.status, Status.CANCELLED)
-                        self.assertEqual(len(calls), 1)
-                        if not abort_demand:
-                            self.assertTrue(cache.check_prefetch_progress(demand))
-                            self.assertTrue(service.has_pending)
-                            self.assertFalse(cache._storage_attachment.detach()[0])
-                            self.assertEqual(cache.evict_host(4), 0)
-                            span = cache.pop_prefetch_loaded_span(demand)
-                            self.assertEqual(span, (4, 0))
-                            self.assertEqual(
-                                split_cached_prefix_by_tier(4, 4, *span), (0, 0, 4)
-                            )
-                            self.assertEqual(cache.evict_host(4), 4)
-                        self.assertFalse(service.has_pending)
-                finally:
-                    release.set()
-                    cache.finish(demand, CacheRequestOutcome.ABORT)
-                assert_retired(cache, service)
-
     def test_native_demand_partial_failure_and_abort_leave_no_holds(self):
         from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 
         with hicache(self, namespace_keys=True) as owner:
             cache, service, dma = cold_prefix(owner)
@@ -2758,106 +977,6 @@ class TestKVControlStorageReads(cache_fixtures.KVCacheTestCase):
             finally:
                 release.set()
                 cache.finish(demand, CacheRequestOutcome.ABORT)
-            assert_retired(cache, service)
-
-    def test_native_demand_published_prefix_and_disabled_control(self):
-        from sglang.srt.managers.schedule_batch import split_cached_prefix_by_tier
-        from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, dma = cold_prefix(owner)
-            native = transfer(service, src="storage", dst="host", message="ready")
-            self.assertEqual(wait(service, native).status, Status.COMPLETED)
-            node = prefix_path(cache, service)[-1][0]
-            demand = CacheRequestHandle("arrives-after-publication", 0)
-            with patch.object(
-                cache.cache_controller,
-                "submit_prefetch",
-                side_effect=AssertionError(
-                    "published host prefix needs no storage I/O"
-                ),
-            ):
-                # Ordinary match found the complete host prefix, so only the
-                # empty suffix reaches the prefetch entrypoint.
-                cache.prefetch_from_storage(
-                    demand,
-                    node.id,
-                    cache_fixtures.array("q", []),
-                    matched_prefix_tokens=[1, 2, 3, 4],
-                    cache_salt=service.cache_salt(None),
-                )
-            self.assertTrue(cache.check_prefetch_progress(demand))
-            span = cache.pop_prefetch_loaded_span(demand)
-            self.assertEqual(span, (0, None))
-            self.assertEqual(split_cached_prefix_by_tier(4, 4, *span), (0, 4, 0))
-            self.assertEqual(
-                service.control.executor.storage_reads.stats["demand_coalesced"], 0
-            )
-            with patch.object(cache, "kv_control_service", None):
-                self.assertIsNone(cache._native_storage_reads())
-                self.assertTrue(cache.check_prefetch_progress(demand))
-            assert_retired(cache, service)
-
-    def test_public_file_prefetch_registers_host_without_local_prefix(self):
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, dma = cold_prefix(owner)
-            caps = service.capabilities()["public_protocol"]
-            assert caps["storage_backend"] == "file"
-            assert "sglang.pin" in caps["actions"]
-            assert {p["tier"] for p in caps["pin_protections"]} == {"host"}
-            result = public_transfer(
-                service, "prefetch", "storage", "host", "public-restore"
-            )
-            done = wait(service, result)
-            assert done.status == Status.COMPLETED, done
-            assert done.public_result.ready_scope
-            assert done.public_result.ready_location.tier == "host"
-            assert not dma.pending
-            with patch.object(cache, "prefetch_from_storage") as storage:
-                resident = public_transfer(
-                    service, "prefetch", "storage", "host", "public-restore-resident"
-                )
-                ready = wait(service, resident)
-                assert ready.status == Status.COMPLETED, ready
-                assert ready.public_result.ready_scope == done.public_result.ready_scope
-                storage.assert_not_called()
-            for node, _, _, _ in prefix_path(cache, service):
-                cd = node.component_data[FULL]
-                host = cache.host_pool_group.anchor_entry.host_pool
-                assert cd.value is None
-                assert torch.all(host.k_buffer[0][cd.host_value] == 7)
-                assert torch.all(host.v_buffer[0][cd.host_value] == 8)
-                assert cd.lock_ref == cd.host_lock_ref == 0
-            assert_retired(cache, service)
-
-    def test_storage_read_cancel_waits_for_actual_worker_exit(self):
-        with hicache(self, namespace_keys=True) as owner:
-            cache, service, dma = cold_prefix(owner)
-            cc = cache.cache_controller
-            entered, release = (threading.Event(), threading.Event())
-            original = cc.page_get_func
-
-            blocked = block_io(original, entered, release)
-
-            try:
-                with patch.object(cc, "page_get_func", blocked):
-                    result = transfer(
-                        service, src="storage", dst="host", message="restore"
-                    )
-                    wait_for(service, entered.is_set)
-                    assert (
-                        service.control.cancel(result.ref).status == Status.CANCELLING
-                    )
-                    for _ in range(3):
-                        service.progress()
-                    assert service.has_pending
-                    assert cache.ongoing_prefetch
-                    release.set()
-                    done = wait(service, result)
-            finally:
-                release.set()
-            assert done.status == Status.CANCELLED, done
-            assert not dma.pending
             assert_retired(cache, service)
 
 

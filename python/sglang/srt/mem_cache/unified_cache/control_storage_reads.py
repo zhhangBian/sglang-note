@@ -8,7 +8,6 @@ from array import array
 from dataclasses import dataclass, field
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     CacheCompatibility,
     ControlError,
@@ -28,6 +27,129 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 FULL = ComponentType.FULL
+
+
+def fence_cache_change(cache, action, reason):
+    reads = cache._native_storage_reads()
+    if reads is not None:
+        if reads.demands:
+            raise RuntimeError(f"Release native prefetch demand before {action}")
+        reads.clear_admission_holds()
+    service = getattr(cache, "kv_control_service", None)
+    if service is not None:
+        service.invalidate_protection(reason=reason)
+
+
+def shareable_read(cache, buffer_mode, minimum, hints):
+    if minimum is None and not buffer_mode:
+        reads = cache._native_storage_reads()
+        # Backend actions need an isolated operation with its own metadata.
+        if reads is not None and not cache.forwards_kv_hint_actions(hints):
+            return reads
+    return None
+
+
+def join_ordinary_demand(reads, request, prefix, key, extra_key, cache_salt):
+    return not reads.cache.tree_core.is_eagle and reads.join_demand(
+        request, prefix, key, extra_key, cache_salt
+    )
+
+
+def record_read_origin(operation, minimum, shared, key, prefix):
+    if minimum is not None:
+        operation.native_prefetch_threshold = minimum
+    elif shared is not None and not key.is_bigram:
+        operation.control_prefix = prefix or ()
+
+
+def observe_ordinary_publication(cache, operation, node_id, completed):
+    if (
+        completed > 0
+        and "control_prefix" in vars(operation)
+        and cache.prefetch_stop_policy == "wait_complete"
+        and (reads := cache._native_storage_reads()) is not None
+    ):
+        reads.hold_for_admission(
+            operation.handle, node_id, operation.storage_start + completed
+        )
+
+
+def parked_read_hits(cache):
+    return [
+        info.operation
+        for info in cache.ongoing_prefetch.values()
+        if getattr(info.operation, "host_allocation_deferred", False)
+    ]
+
+
+def can_defer_read_staging(cache, controller):
+    return (
+        cache._native_storage_reads() is not None
+        and cache.host_memory_mode == "cache"
+        and cache.tree_core.component_types == (FULL,)
+        and not controller.prefetch_completion_sync_groups
+    )
+
+
+def read_staging_backpressured(operation, controller):
+    operation.host_allocation_deferred = None
+    if controller.prefetch_buffer.empty():
+        return False
+    # Keep at most one ready successor to the active single-consumer read.
+    operation.host_allocation_deferred = "io"
+    return True
+
+
+def allocate_read_hit(cache, operation, info, hit_tokens):
+    allocator = vars(operation).get("native_allocate_host")
+    if allocator is not None:
+        allocation = allocator(hit_tokens)
+        if allocation is None:
+            operation.host_allocation_deferred = "host"
+            return None
+        return (*allocation, cache.ongoing_prefetch[operation.handle])
+    threshold = vars(operation).get("native_prefetch_threshold")
+    allow_partial = threshold is None and not info.comp_xfers
+    if threshold is None:
+        threshold = cache.prefetch_threshold if allow_partial else hit_tokens
+    allocation = cache.cache_controller.allocate_storage_hit(
+        operation,
+        hit_tokens,
+        allow_partial=allow_partial,
+        min_tokens=threshold,
+        evict_host=cache.evict_host,
+    )
+    return (*allocation, info)
+
+
+def drain_parked_read_hits(cache, operations, allocate):
+    # Stable ordering within each class. A hint joined by demand counts as demand.
+    def speculative(operation):
+        demands = getattr(operation, "native_demands", None)
+        return demands is not None and not demands
+
+    operations.sort(key=speculative)
+    io_busy = False
+    for operation in operations:
+        was_parked = getattr(operation, "host_allocation_deferred", False)
+        if io_busy:
+            operation.host_allocation_deferred = "io"
+        elif allocate(operation):
+            continue
+        else:
+            io_busy = operation.host_allocation_deferred == "io"
+        if not was_parked:
+            cache._prefetch_outcome_stats["declined_rate_limited"] += 1
+
+
+def mark_read_query_done(operation):
+    if hasattr(operation, "native_quiescent") or hasattr(operation, "control_prefix"):
+        operation.native_query_done = True
+
+
+def mark_read_quiescent(operation):
+    if hasattr(operation, "native_quiescent"):
+        operation.native_quiescent = True
 
 
 class _ReadKey(msgspec.Struct, frozen=True, cache_hash=True):
@@ -162,6 +284,20 @@ class StorageCacheReads:
     @staticmethod
     def _demand_key(tokens, extra_key, cache_salt):
         return tokens, extra_key, cache_salt
+
+    def merge_loaded_span(self, request, count, start):
+        if self.demand_ready(request):
+            shared_count, shared_start = self.release_demand(request)
+            if shared_count:
+                if shared_start + shared_count == start:
+                    return shared_count + count, shared_start
+                # A resident L2 gap between the spans is not a storage hit.
+                return shared_count, shared_start
+        return count, start
+
+    def retire_attempt(self, request):
+        self.release_admission(request)
+        self.release_demand(request, aborted=True)
 
     def hold_for_admission(self, request, node_id, end_token):
         if (

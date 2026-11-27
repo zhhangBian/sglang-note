@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import math
-import re
 from enum import Enum
 from typing import Annotated, Literal, TypeAlias
 
 import msgspec
-
 from sglang.srt.managers.kv_hints import KvHintAction
 
 PROTOCOL_VERSION = "0.1"
@@ -63,7 +61,6 @@ class ControlContext(Value):
     engine_epoch: Identifier
     namespace: Identifier
     caller_id: Identifier
-    # A unique request *incarnation*, including batch/sampling fan-out identity.
     binding_id: Identifier | None = None
 
 
@@ -113,9 +110,6 @@ class TokensTarget(CacheCompatibility, tag="tokens", tag_field="kind", kw_only=T
     allow_clip: bool = False
 
 
-Target: TypeAlias = TokensTarget | Literal["request_cached"]
-
-
 class ResolvedTarget(Value):
     engine_epoch: str
     content: TokensTarget
@@ -161,9 +155,6 @@ class Location(Value, omit_defaults=True):
 # Event hashes are signed i64 decimal strings, never JSON numbers or storage keys.
 HASH_SCHEME = "sglang.sha256.u32le.i64.v1"
 RESULT_VERSION = "1.0"
-Hash64: TypeAlias = Annotated[
-    str, msgspec.Meta(pattern=r"^(0|-[1-9][0-9]*|[1-9][0-9]*)$", max_length=20)
-]
 TokenId: TypeAlias = Annotated[int, msgspec.Meta(ge=0, le=(1 << 32) - 1)]
 
 
@@ -178,14 +169,6 @@ class PrefixCompatibility(Value):
     hash_scheme: Identifier
 
 
-class PrefixBlock(Value):
-    block_hash: Hash64
-    component: Identifier
-    start_token: Position
-    end_token: Position
-    dependency_start: Position = 0
-
-
 class PrefixTarget(Value, tag="prefix", tag_field="kind"):
     compatibility: PrefixCompatibility
     start_token: Position
@@ -197,7 +180,6 @@ class PrefixTarget(Value, tag="prefix", tag_field="kind"):
         ]
         | None
     ) = None
-    blocks: Annotated[tuple[PrefixBlock, ...], msgspec.Meta(max_length=4096)] = ()
 
     @property
     def namespace(self):
@@ -211,7 +193,7 @@ class PublicLocation(Value):
     backend_namespace: Identifier | None = None
 
 
-PublicTarget: TypeAlias = Target | PrefixTarget
+PublicTarget: TypeAlias = TokensTarget | PrefixTarget
 
 
 class TransferPayload(Value):
@@ -241,8 +223,6 @@ class Pin(Value):
     required_protection: Literal["eviction_exclusion", "eviction_priority"] | None = (
         None
     )
-    # Explicit demand ownership, independent of the selected content/session.
-    owner_task: TaskIdentity | None = None
 
 
 class ClaimState(Value):
@@ -262,7 +242,6 @@ class ClaimState(Value):
     )
     remaining_ttl: Seconds | None = None
     priority: Priority | None = None
-    owner_task: TaskIdentity | None = None
     actual_scope: tuple[TargetOutcome, ...] = ()
     location: PublicLocation | None = None
 
@@ -317,11 +296,6 @@ class TargetOutcome(Value):
     # Checkpoints are points [end, end], not per-token physical coverage.
     coverage_kind: Literal["tokens", "window", "checkpoint"] = "tokens"
     window_size: Position | None = None
-
-
-class TaskIdentity(Value):
-    session_id: Identifier
-    incarnation: Position
 
 
 class ExecutionUpdate(Value):
@@ -430,30 +404,6 @@ def validate_prefix(target: PrefixTarget) -> None:
         raise ControlError(
             "invalid_payload", "Token material must cover exactly [0, end_token)"
         )
-    previous = {}
-    for block in target.blocks:
-        if not re.fullmatch(r"0|-[1-9][0-9]*|[1-9][0-9]*", block.block_hash) or not -(
-            1 << 63
-        ) <= int(block.block_hash) < (1 << 63):
-            raise ControlError(
-                "invalid_payload", "Block hash must be a canonical decimal i64 string"
-            )
-        if (
-            block.component not in c.components
-            or not 0
-            <= block.dependency_start
-            <= block.start_token
-            < block.end_token
-            <= target.end_token
-            or block.end_token - block.start_token != c.page_size
-            or block.dependency_start % c.page_size
-            or block.start_token % c.page_size
-            or block.start_token < previous.get(block.component, 0)
-        ):
-            raise ControlError(
-                "invalid_payload", "Invalid ordered block/dependency descriptor"
-            )
-        previous[block.component] = block.end_token
 
 
 def validate_public(payload):
@@ -500,20 +450,12 @@ _ACTION_SCHEMAS = {
 PUBLIC_ACTIONS = tuple(_ACTION_SCHEMAS)
 
 
-def is_native_action(action: KvHintAction) -> bool:
-    return (
-        action.action_version == ACTION_VERSION
-        and action.action_type in _ACTION_SCHEMAS
-    )
-
-
 def parse_action(action: KvHintAction) -> Payload:
     """Interpret a supported action after generic forwarding has selected its owner."""
     schema = _ACTION_SCHEMAS.get(action.action_type)
     if schema is None or action.action_version != ACTION_VERSION:
         raise ControlError("unsupported", "Unsupported native action or action version")
     payload = validated(action.payload, schema)
-    if payload.target != "request_cached":
-        validate_target(payload.target)
+    validate_target(payload.target)
     validate_public(payload)
     return payload

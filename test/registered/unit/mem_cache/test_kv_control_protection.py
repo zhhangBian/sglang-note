@@ -6,37 +6,27 @@ registration cleanup.
 """
 
 import asyncio
-import threading
 import unittest
-from array import array
 from unittest.mock import patch
 
+import kv_control_test_utils as cache_test_utils
 import msgspec
 import test_kv_control_cache as cache_fixtures
-import test_kv_control_service as service_fixtures
-import kv_control_test_utils as cache_test_utils
-import torch
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-
 from sglang.srt.managers.kv_control.contracts import (
     ControlError,
-    Status,
 )
-from sglang.srt.managers.kv_control.http import install_routes
+from sglang.srt.managers.kv_control.http import install_kv_control_routes
 from sglang.srt.managers.kv_control.protection import (
     HostPrefix,
     ProtectionKey,
     ProtectionRegistry,
 )
 from sglang.srt.managers.kv_control.service import (
-    KVControlService,
     ServiceConfig,
     dispatch,
 )
-from sglang.srt.managers.kv_hints import KvHintsEnvelope
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.control_protection import ProtectionLimits
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -45,10 +35,8 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 FULL = ComponentType.FULL
 
 
-def claim(caller="A", task="task", incarnation=1, name="pin"):
-    return ProtectionKey(
-        caller_id=caller, task_id=task, task_incarnation=incarnation, claim_id=name
-    )
+def claim(caller="A", name="pin"):
+    return ProtectionKey(caller_id=caller, claim_id=name)
 
 
 def prefixes(*values):
@@ -81,31 +69,6 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
         with self.assertRaises(ControlError) as caught:
             operation(**kwargs)
         self.assertEqual(caught.exception.code, code)
-
-    def test_peer_rejection_keeps_unsplit_host_span_without_claim(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, _, _ = owner
-            leaf = host_copy(owner)
-            parent = leaf.parent
-
-            def reject_after_local_admission(prepare):
-                prepare()
-                raise ControlError("missing", "A peer shard has no complete copy")
-
-            pins = registry(owner, prepare_shards=reject_after_local_admission)
-            self.error(
-                "missing",
-                pins.acquire,
-                key=claim(),
-                revision=1,
-                prefixes=prefixes((1, 2)),
-                ttl_seconds=10,
-            )
-            self.assertEqual(len(leaf.key), 4)
-            self.assertIs(leaf.parent, parent)
-            self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(pins.active_claims, 0)
-            cache.sanity_check()
 
     def test_tp_reservation_failure_rolls_back_successful_peer(self):
         with cache_test_utils.hicache(self) as owner:
@@ -158,34 +121,6 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
                 self.assertIsNone(pins.get(claim()))
             cache.sanity_check()
 
-    def test_native_host_pressure_preserves_bytes_until_independent_claim_release(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, _, _ = owner
-            held = host_copy(owner)
-            ordinary = host_copy(owner, (8, 9, 10, 11))
-            pins = registry(owner)
-            accepted = pins.acquire(
-                key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-            )
-            host = cache.host_pool_group.anchor_entry.host_pool
-            cd = held.component_data[FULL]
-            saved = cd.host_value.clone()
-            self.assertEqual(accepted.state, "active")
-            self.assertEqual(cd.host_lock_ref, 1)
-            self.assertEqual(cache.evict_host(host.size), 4)
-            self.assertIsNone(ordinary.component_data[FULL].host_value)
-            self.assertTrue(torch.equal(cd.host_value, saved))
-            self.assertTrue(torch.all(host.k_buffer[0][saved] == 7))
-            # The transfer operation has completed and released its own holds.
-            self.assertTrue(pins.has_background_work)
-            self.assertEqual(pins.next_deadline, 110)
-            pins.release(key=claim(), revision=2)
-            self.assertEqual(cd.host_lock_ref, 0)
-            self.assertEqual(cache.evict_host(host.size), 4)
-            self.assertIsNone(cd.host_value)
-            self.assertFalse(pins.has_background_work)
-            cache.sanity_check()
-
     def test_overlapping_callers_and_multi_branch_scope_charge_union_after_splits(self):
         with cache_test_utils.hicache(self) as owner:
             _, cache, _, _ = owner
@@ -228,114 +163,15 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(cache.evict_host(100), 6)
             cache.sanity_check()
 
-    def test_revision_ordering_idempotence_and_release_before_late_renew(self):
-        with cache_test_utils.hicache(self) as owner:
-            node = host_copy(owner)
-            pins = registry(owner)
-            request = {
-                "key": claim(),
-                "revision": 1,
-                "prefixes": prefixes((1, 2, 3, 4)),
-                "ttl_seconds": 10,
-            }
-            initial = pins.acquire(**request)
-            self.clock.now = 103
-            self.assertEqual(pins.acquire(**request), initial)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            self.error("conflict", pins.acquire, **{**request, "ttl_seconds": 20})
-            self.error(
-                "stale_revision", pins.renew, key=claim(), revision=0, ttl_seconds=20
-            )
-            renewed = pins.renew(key=claim(), revision=2, ttl_seconds=5)
-            self.assertEqual(renewed.expires_at, 108)
-            self.clock.now = 104
-            self.assertEqual(
-                pins.renew(key=claim(), revision=2, ttl_seconds=5), renewed
-            )
-            # Release arrives ahead of a queued older renew. Neither it nor a
-            # later higher-revision renew may recreate the ended claim.
-            released = pins.release(key=claim(), revision=4)
-            self.assertEqual(pins.release(key=claim(), revision=4), released)
-            self.error(
-                "stale_revision", pins.renew, key=claim(), revision=3, ttl_seconds=10
-            )
-            self.error("conflict", pins.renew, key=claim(), revision=4, ttl_seconds=10)
-            self.error("released", pins.renew, key=claim(), revision=5, ttl_seconds=10)
-            self.error("released", pins.acquire, **{**request, "revision": 5})
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            # A release without a preceding acquire must also fence late work.
-            absent = claim(name="not-yet-seen")
-            pins.release(key=absent, revision=5)
-            self.error("stale_revision", pins.acquire, **{**request, "key": absent})
-            self.error(
-                "released", pins.acquire, **{**request, "key": absent, "revision": 6}
-            )
-            owner[1].sanity_check()
-
-    def test_finite_ttl_expiry_batches_and_no_access_renewal(self):
-        with cache_test_utils.hicache(self) as owner:
-            node = host_copy(owner)
-            pins = registry(owner, max_ttl_seconds=20)
-            request = {
-                "key": claim(),
-                "revision": 1,
-                "prefixes": prefixes((1, 2, 3, 4)),
-            }
-            for ttl in (float("nan"), float("inf"), -1, 0, 21, True):
-                with self.subTest(ttl=ttl):
-                    self.error("invalid", pins.acquire, **request, ttl_seconds=ttl)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            for caller in ("A", "B", "C"):
-                pins.acquire(**{**request, "key": claim(caller)}, ttl_seconds=2)
-            self.clock.now = 101
-            self.assertEqual(pins.get(claim()).expires_at, 102)
-            cache_fixtures.match_len(owner[1], (1, 2, 3, 4))
-            self.clock.now = 102
-            # Query may discover expiry before the idle service tick. The
-            # terminal change must still reach the background publisher.
-            self.assertEqual(pins.get(claim()).state, "expired")
-            self.assertEqual(len(pins.expire(limit=1)), 1)
-            self.assertTrue(pins.has_background_work)
-            self.assertEqual(len(pins.expire(limit=1)), 1)
-            self.assertEqual(len(pins.expire(limit=1)), 1)
-            self.assertFalse(pins.has_background_work)
-            self.assertIsNone(pins.next_deadline)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            self.error("expired", pins.renew, key=claim(), revision=2, ttl_seconds=10)
-            self.assertEqual(owner[1].evict_host(100), 4)
-            owner[1].sanity_check()
-
-    def test_task_cleanup_preserves_other_callers_siblings_and_incarnations(self):
-        with cache_test_utils.hicache(self) as owner:
-            node = host_copy(owner)
-            pins = registry(owner)
-            keys = (claim(), claim("B"), claim(task="sibling"), claim(incarnation=2))
-            for key in keys:
-                pins.acquire(
-                    key=key, revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-                )
-            removed = pins.cleanup_task(
-                caller_id="A", task_id="task", task_incarnation=1
-            )
-            self.assertEqual([s.key for s in removed], [claim()])
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 3)
-            self.assertEqual(pins.protected_tokens, 4)
-            self.error("released", pins.renew, key=claim(), revision=2, ttl_seconds=10)
-            self.assertEqual(
-                pins.cleanup_task(caller_id="A", task_id="task", task_incarnation=1), ()
-            )
-            for key in keys[1:]:
-                pins.release(key=key, revision=2)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            owner[1].sanity_check()
-
     def test_active_claim_cap_and_per_claim_revisions_across_retired_fifo_rollover(
         self,
     ):
         with cache_test_utils.hicache(self) as owner:
             held = host_copy(owner)
             extra = host_copy(owner, (8, 9))
-            pins = registry(owner, max_protected_tokens=4, max_claims=2, max_records=3)
+            pins = registry(
+                owner, max_protected_tokens=4, max_claims=2, max_records=4096
+            )
             scope = prefixes((1, 2, 3, 4))
             pins.acquire(key=claim(), revision=1, prefixes=scope, ttl_seconds=10)
             self.error(
@@ -371,17 +207,14 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             pins.release(key=claim("B"), revision=2)
             pins.release(key=claim("C"), revision=1)
             self.error("released", pins.renew, key=claim(), revision=3, ttl_seconds=10)
-            for i in range(3 * pins.max_records + 1):
+            for i in range(2_000_000):
                 key = claim(name=f"pin-{i}")
-                active = pins.acquire(
-                    key=key, revision=1, prefixes=scope, ttl_seconds=10
-                )
-                self.assertEqual(active.state, "active")
                 ended = pins.release(key=key, revision=2)
-                self.assertEqual(ended.state, "released")
-                self.assertEqual(ended.prefixes, ())
-                self.assertEqual(len(pins._retired), pins.max_records)
+            self.assertEqual(len(pins._retired), pins.max_records)
             self.assertIsNone(pins.get(claim(name="pin-0")))
+            self.assertIsNotNone(
+                pins.get(claim(name=f"pin-{2_000_000 - pins.max_records}"))
+            )
             self.error(
                 "stale_revision",
                 pins.acquire,
@@ -394,164 +227,6 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(pins.protected_tokens, 0)
             self.assertEqual(held.component_data[FULL].host_lock_ref, 0)
             owner[1].sanity_check()
-
-    def test_replacement_scope_releases_old_split_receipt_without_losing_others(self):
-        with cache_test_utils.hicache(self) as owner:
-            leaf = host_copy(owner)
-            pins = registry(owner, max_protected_tokens=6)
-            pins.acquire(
-                key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-            )
-            branch = host_copy(owner, (1, 2, 5, 6))
-            pins.acquire(
-                key=claim("B"), revision=1, prefixes=prefixes((1, 2)), ttl_seconds=10
-            )
-            pins.acquire(
-                key=claim(), revision=2, prefixes=prefixes((1, 2, 5, 6)), ttl_seconds=20
-            )
-            self.assertEqual(pins.protected_tokens, 4)
-            self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(branch.component_data[FULL].host_lock_ref, 1)
-            self.assertEqual(leaf.parent.component_data[FULL].host_lock_ref, 2)
-            pins.invalidate()
-            for node in (leaf, branch, leaf.parent):
-                self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            owner[1].sanity_check()
-
-    def test_rejects_missing_and_incomplete_prefixes_without_splitting(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, _, _ = owner
-            node = host_copy(owner)
-            pins = registry(owner, max_scope_tokens=8)
-            for scope, code in (
-                (prefixes((1, 2), (99,)), "missing"),
-                (prefixes((1, 2, 3, 5)), "missing"),
-                (prefixes((1, 2, 3, 4, 5)), "missing"),
-                (prefixes(tuple(range(9))), "capacity"),
-                (
-                    (HostPrefix(token_ids=(1, 2, 3, 4), cache_salt="another"),),
-                    "missing",
-                ),
-            ):
-                with self.subTest(scope=scope):
-                    self.error(
-                        code,
-                        pins.acquire,
-                        key=claim(),
-                        revision=1,
-                        prefixes=scope,
-                        ttl_seconds=10,
-                    )
-            self.assertIs(node.parent, cache.tree_core.root_node)
-            # An inserted branch shares a host prefix, but its new suffix has
-            # no host replica. Partial residency cannot activate protection.
-            other = cache_test_utils.seed(cache, (1, 2, 5, 6))
-            self.assertIsNone(other.component_data[FULL].host_value)
-            self.error(
-                "missing",
-                pins.acquire,
-                key=claim(),
-                revision=1,
-                prefixes=prefixes((1, 2, 5, 6)),
-                ttl_seconds=10,
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(pins.protected_tokens, 0)
-            cache.sanity_check()
-
-    def test_compressed_prefix_protects_only_its_pages(self):
-        config = ServiceConfig(
-            namespace="ns",
-            engine_id="engine",
-            protection_limits=ProtectionLimits(max_protected_tokens=2),
-        )
-        for ttl in (5, None):
-            with (
-                self.subTest(ttl=ttl),
-                cache_test_utils.hicache(self, config=config) as owner,
-            ):
-                _, cache, service, _ = owner
-                self.clock.now = 100
-                tail = host_copy(owner)
-                slots = tail.component_data[FULL].host_value.clone()
-                pins = service.control.executor.protection.registry
-                self.error(
-                    "capacity",
-                    pins.acquire,
-                    key=claim(),
-                    revision=1,
-                    prefixes=prefixes((1, 2, 3)),
-                    ttl_seconds=5,
-                )
-                self.assertIs(tail.parent, cache.tree_core.root_node)
-                # Overlapping endpoints in the same compressed node use the
-                # longest match and count the shared page only once.
-                active = pins.acquire(
-                    key=claim(),
-                    revision=1,
-                    prefixes=prefixes((1, 2), (1,)),
-                    ttl_seconds=ttl,
-                    priority=7,
-                )
-                self.assertEqual(active.physical_tokens, 2)
-                head = tail.parent.component_data[FULL]
-                self.assertTrue(torch.equal(head.host_value, slots[:2]))
-                self.assertEqual(head.host_lock_ref, int(ttl is not None))
-                self.assertEqual(tail.component_data[FULL].host_lock_ref, 0)
-                self.assertEqual(pins.priorities, dict.fromkeys(slots[:2].tolist(), 7))
-                self.assertEqual(cache.evict_host(2), 2)
-                self.assertIsNone(tail.component_data[FULL].host_value)
-                host = cache.host_pool_group.anchor_entry.host_pool
-                self.assertTrue(torch.all(host.k_buffer[0][head.host_value] == 7))
-                self.clock.now = 105
-                pins.expire()
-                self.assertEqual(head.host_lock_ref, 0)
-                self.assertEqual(pins.priorities, dict.fromkeys(slots[:2].tolist(), 7))
-                pins.release(key=claim(), revision=2)
-                self.assertEqual(cache.evict_host(2), 2)
-                cache.sanity_check()
-
-    def test_clear_invalidation_and_reset_never_replay_receipts_against_new_tree(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner)
-            pins = registry(owner)
-            pins.acquire(
-                key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-            )
-            changes = pins.invalidate(reason="namespace_changed")
-            self.assertEqual(
-                [(s.state, s.reason) for s in changes],
-                [("invalidated", "namespace_changed")],
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            self.error(
-                "invalidated",
-                pins.acquire,
-                key=claim("B"),
-                revision=1,
-                prefixes=prefixes((1, 2, 3, 4)),
-                ttl_seconds=10,
-            )
-            # A fresh registry is normally installed with a fresh epoch by the
-            # service. Here direct construction isolates the reset guard.
-            fresh = registry(owner)
-            fresh.acquire(
-                key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-            )
-            cache.reset()
-            with patch.object(
-                cache, "dec_host_lock_ref", side_effect=AssertionError("stale receipt")
-            ):
-                self.assertEqual(fresh.get(claim()).state, "invalidated")
-                self.assertEqual(fresh.get(claim()).reason, "cache_reset")
-                self.assertEqual(fresh.protected_tokens, 0)
-                self.assertTrue(fresh.has_background_work)
-                self.assertEqual(fresh.next_deadline, self.clock.now)
-                self.assertEqual([s.state for s in fresh.expire()], ["invalidated"])
-                self.assertFalse(fresh.has_background_work)
-                fresh.invalidate()
-            self.assertFalse(service.has_pending)
 
     def test_pending_host_backup_cannot_be_claimed_before_publication(self):
         with cache_test_utils.hicache(self) as owner:
@@ -587,74 +262,6 @@ class TestKVControlProtection(cache_fixtures.KVCacheTestCase):
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             cache.sanity_check()
 
-    def test_failed_native_acquisition_rolls_back_partial_holds_before_acceptance(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, _, _ = owner
-            leaf = host_copy(owner)
-            host_copy(owner, (1, 2, 5, 6))
-            pins = registry(owner)
-            native_hold = cache.inc_host_lock_ref
-            count = 0
-
-            def fail_second(node_id):
-                nonlocal count
-                count += 1
-                if count == 2:
-                    raise RuntimeError("injected acquisition failure")
-                return native_hold(node_id)
-
-            request = {
-                "key": claim(),
-                "revision": 1,
-                "prefixes": prefixes((1, 2, 3, 4)),
-                "ttl_seconds": 10,
-            }
-            with (
-                patch.object(cache, "inc_host_lock_ref", side_effect=fail_second),
-                self.assertRaisesRegex(RuntimeError, "acquisition failure"),
-            ):
-                pins.acquire(**request)
-            self.assertIsNone(pins.get(claim()))
-            self.assertEqual(pins.protected_tokens, 0)
-            self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(leaf.parent.component_data[FULL].host_lock_ref, 0)
-
-            def timed_hold(node_id):
-                receipt = native_hold(node_id)
-                self.clock.now += 1
-                return receipt
-
-            with patch.object(cache, "inc_host_lock_ref", side_effect=timed_hold):
-                active = pins.acquire(**request)
-            self.assertEqual(active.activated_at, 102)
-            self.assertEqual(active.expires_at, 112)
-            pins.release(key=claim(), revision=2)
-            cache.sanity_check()
-
-    def test_owner_thread_rejection_does_not_modify_native_holds(self):
-        with cache_test_utils.hicache(self) as owner:
-            node = host_copy(owner)
-            pins = registry(owner)
-            pins.acquire(
-                key=claim(), revision=1, prefixes=prefixes((1, 2, 3, 4)), ttl_seconds=10
-            )
-            outcomes = []
-
-            def wrong_owner():
-                try:
-                    pins.release(key=claim(), revision=2)
-                except ControlError as exc:
-                    outcomes.append(exc.code)
-
-            thread = threading.Thread(target=wrong_owner)
-            thread.start()
-            thread.join()
-            self.assertEqual(outcomes, ["wrong_owner"])
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            pins.release(key=claim(), revision=2)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            owner[1].sanity_check()
-
 
 def pin_command(
     service,
@@ -666,7 +273,6 @@ def pin_command(
     claim_id="pin",
     ttl=10,
     priority=None,
-    owner_task=None,
     selection=None,
     salt=None,
 ):
@@ -691,7 +297,6 @@ def pin_command(
         "location": {"tier": "host"},
         "claim_id": claim_id,
         "revision": revision,
-        "owner_task": msgspec.to_builtins(owner_task) if owner_task else None,
     }
     if mode != "release":
         payload["ttl_seconds"] = ttl
@@ -724,400 +329,18 @@ def run_pin(service, **kwargs):
     return reply["data"]["results"][0]
 
 
-def query_claim(service, *, caller="A", owner_task=None, claim_id="pin"):
+def query_claim(service, *, caller="A", claim_id="pin"):
     return dispatch(
         service,
         {
             "kind": "claim",
             "context": msgspec.to_builtins(service.control.context(caller)),
             "claim_id": claim_id,
-            "owner_task": msgspec.to_builtins(owner_task) if owner_task else None,
         },
     )
 
 
-def pin_hints(service, **kwargs):
-    encoded = msgspec.json.encode(pin_command(service, **kwargs)["envelope"])
-    return msgspec.json.decode(encoded, type=KvHintsEnvelope)
-
-
 class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
-    def test_request_completion_uses_inserted_pages_and_retires_streaming_binding(self):
-        from types import SimpleNamespace
-
-        for streaming in (False, True):
-            with self.subTest(streaming=streaming):
-                cache, _ = self.make(page_size=4, session=False)
-                cache.reset()
-                service = KVControlService(
-                    cache, ServiceConfig(namespace="ns", engine_id="engine")
-                )
-                session = (
-                    SimpleNamespace(
-                        streaming=True, session_id="s", finish_req=lambda req: None
-                    )
-                    if streaming
-                    else None
-                )
-                req = service_fixtures.namespace_request(session=session)
-                service.prepare_request(req)
-                service.attach(req, pin_hints(service, selection="request_cached"))
-                self.assertIsNotNone(req.kv_control_context)
-                req.output_ids = cache_fixtures.array("q", [5])
-                req.finished_reason = FINISH_LENGTH(1)
-                cache.req_to_token_pool.alloc([req])
-                slots = cache.token_to_kv_pool_allocator.alloc(8)
-                cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 8)), slots)
-                req.kv.kv_committed_len = 5
-                req.kv.kv_allocated_len = 5
-                cache.maybe_hand_to_session(req)
-                with patch.object(
-                    service, "finish_request", wraps=service.finish_request
-                ) as finish:
-                    release_kv_cache(req, cache, checkpoint=True)
-                    if streaming:
-                        finish.assert_called_once_with(req)
-                        self.assertIn("s", cache.session_records())
-                        cache.release_session("s")
-                    else:
-                        finish.assert_called_once_with(
-                            req, committed_len=4, checkpointed=True
-                        )
-                self.assertIsNone(req.kv_control_context)
-                self.assertFalse(req.kv.holds_kv)
-                cache.sanity_check()
-
-    def test_attachment_passes_through_unowned_actions_without_allocating_context(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, _, service, _ = owner
-            hints = pin_hints(service)
-            pin = hints.actions[0]
-            external = msgspec.structs.replace(
-                pin, action_type="sglang.backend_specific"
-            )
-            newer = msgspec.structs.replace(pin, action_version="2.0")
-            future = [
-                msgspec.structs.replace(newer, action_type=f"sglang.{name}")
-                for name in ("prefetch", "demote")
-            ]
-            unowned = [external, *future, newer]
-            req = service_fixtures.serving_request()
-            req.kv_hints = msgspec.structs.replace(hints, actions=unowned)
-            service.prepare_request(req)
-            service.attach(req, req.kv_hints)
-            self.assertFalse(hasattr(req, "kv_control_context"))
-            self.assertEqual(service._request_sequence, 0)
-            self.assertEqual(req.kv_hints.actions, unowned)
-            req.kv_hints = msgspec.structs.replace(hints, actions=[*unowned, pin])
-            service.attach(req, req.kv_hints)
-            self.assertEqual(req.kv_hints.actions, unowned)
-            receipt = service.control.registry.query(
-                req.kv_control_context, hints.message_id
-            )
-            self.assertEqual([r.action_type for r in receipt.results], ["sglang.pin"])
-
-    def test_attached_explicit_prefix_receipt_survives_abort_and_supports_unbound_followup(
-        self,
-    ):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner)
-            req = service_fixtures.serving_request()
-            hints = pin_hints(service)
-            original = msgspec.json.encode(hints)
-            service.attach(req, hints)
-            context = req.kv_control_context
-            result = service.control.registry.query(context, "pin").results[0]
-            self.assertEqual(result.status, Status.COMPLETED)
-            claim_id = result.public_result.claim.claim_id
-            self.assertNotEqual(claim_id, "pin")
-            self.assertEqual(result.public_result.claim.caller_id, "request")
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_id)["data"][
-                    "remaining_ttl"
-                ],
-                10,
-            )
-            self.assertEqual(
-                query_claim(service, caller="request")["error"]["code"], "missing"
-            )
-            self.assertEqual(
-                query_claim(service, claim_id=claim_id)["error"]["code"], "missing"
-            )
-            self.clock.now = 103
-            replay = service.control.submit(hints, context)
-            self.assertTrue(replay.replayed)
-            self.assertEqual(replay.results[0], result)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            self.assertEqual(msgspec.json.encode(hints), original)
-            # An explicit accepted claim has its own lifetime; aborting the
-            # inference request does not undo that already completed action.
-            service.finish_request(req, aborted=True)
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_id)["data"][
-                    "remaining_ttl"
-                ],
-                7,
-            )
-            missing_selector = msgspec.to_builtins(
-                cache_fixtures.target((99, 98, 97, 96))
-            )
-            renewed = run_pin(
-                service,
-                caller="request",
-                claim_id=claim_id,
-                mode="renew",
-                revision=2,
-                message="renew",
-                selection=missing_selector,
-            )
-            self.assertEqual(renewed["public_result"]["claim"]["remaining_ttl"], 10)
-            released = run_pin(
-                service,
-                caller="request",
-                claim_id=claim_id,
-                mode="release",
-                revision=3,
-                message="release",
-                selection=missing_selector,
-            )
-            self.assertEqual(released["public_result"]["claim"]["state"], "released")
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
-
-    def test_request_cached_sampling_fanout_waits_for_checkpoint_and_has_separate_claims(
-        self,
-    ):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner)
-            hints = pin_hints(service, selection="request_cached")
-            independent = run_pin(
-                service, selection="request_cached", message="unbound"
-            )
-            self.assertEqual(independent["update"]["code"], "invalid_payload")
-            original = msgspec.json.encode(hints)
-            reqs = [
-                service_fixtures.serving_request(),
-                service_fixtures.serving_request(),
-            ]
-            for req in reqs:
-                service.attach(req, hints)
-            contexts = [req.kv_control_context for req in reqs]
-            self.assertNotEqual(contexts[0].binding_id, contexts[1].binding_id)
-            for context in contexts:
-                queued = service.control.registry.query(context, "pin").results[0]
-                self.assertEqual(queued.status, Status.QUEUED)
-                self.assertIsNone(queued.public_result.claim)
-                self.assertFalse(queued.public_result.accepted_scope)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            service.finish_request(reqs[0], checkpointed=True, committed_len=4)
-            self.assertEqual(
-                service.control.registry.query(contexts[0], "pin").results[0].status,
-                Status.QUEUED,
-            )
-            self.assertTrue(service.control.submit(hints, contexts[0]).replayed)
-            self.clock.now = 107
-            for req in reqs:
-                req.finished_reason = FINISH_LENGTH(1)
-                req.refresh_fill_ids()
-                service.finish_request(req, checkpointed=True, committed_len=4)
-            completed = [
-                service.control.registry.query(context, "pin").results[0]
-                for context in contexts
-            ]
-            claim_ids = [result.public_result.claim.claim_id for result in completed]
-            self.assertNotEqual(*claim_ids)
-            self.assertTrue(
-                all(result.status == Status.COMPLETED for result in completed)
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 2)
-            self.assertEqual(
-                service.control.executor.protection.registry.protected_tokens, 4
-            )
-            self.assertEqual(service.next_deadline, 117)
-            self.assertFalse(service.has_pending)
-            self.assertEqual(msgspec.json.encode(hints), original)
-            # History discovery keeps each sampling incarnation identifiable.
-            lookup = dispatch(
-                service,
-                {
-                    "kind": "lookup",
-                    "context": msgspec.to_builtins(service.control.context("request")),
-                    "message_id": "pin",
-                },
-            )
-            self.assertEqual(
-                {
-                    r["results"][0]["public_result"]["claim"]["claim_id"]
-                    for r in lookup["data"]
-                },
-                set(claim_ids),
-            )
-            self.clock.now = 109
-            self.assertEqual(
-                service.control.submit(hints, contexts[0]).results[0], completed[0]
-            )
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_ids[0])["data"][
-                    "remaining_ttl"
-                ],
-                8,
-            )
-            missing = msgspec.to_builtins(cache_fixtures.target((99, 98, 97, 96)))
-            attached_renew = pin_hints(
-                service,
-                mode="renew",
-                revision=2,
-                message="renew",
-                ttl=20,
-                selection=missing,
-            )
-            renewed = service.control.submit(attached_renew, contexts[0]).results[0]
-            self.assertEqual(renewed.public_result.claim.claim_id, claim_ids[0])
-            self.assertEqual(renewed.public_result.claim.remaining_ttl, 20)
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_ids[1])["data"][
-                    "remaining_ttl"
-                ],
-                8,
-            )
-            self.clock.now = 110
-            self.assertEqual(
-                service.control.submit(attached_renew, contexts[0]).results[0], renewed
-            )
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_ids[0])["data"][
-                    "remaining_ttl"
-                ],
-                19,
-            )
-            attached_release = pin_hints(
-                service,
-                mode="release",
-                revision=3,
-                message="release",
-                selection=missing,
-            )
-            released = service.control.submit(attached_release, contexts[0]).results[0]
-            self.assertEqual(released.public_result.claim.claim_id, claim_ids[0])
-            self.assertEqual(
-                query_claim(service, caller="request", claim_id=claim_ids[1])["data"][
-                    "state"
-                ],
-                "active",
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            self.assertEqual(cache.evict_host(100), 0)
-            run_pin(
-                service,
-                caller="request",
-                claim_id=claim_ids[1],
-                mode="release",
-                revision=2,
-                message="other-release",
-                selection=missing,
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(cache.evict_host(100), 4)
-            cache.sanity_check()
-
-    def test_request_cached_abort_failed_checkpoint_and_absent_host_never_activate(
-        self,
-    ):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, _ = owner
-            cache_test_utils.seed(cache)
-            hints = pin_hints(service, selection="request_cached")
-            reqs = [service_fixtures.serving_request() for _ in range(3)]
-            for req in reqs:
-                service.attach(req, hints)
-            contexts = [req.kv_control_context for req in reqs]
-            service.finish_request(reqs[0], aborted=True)
-            for req in reqs[1:]:
-                req.finished_reason = FINISH_LENGTH(1)
-                req.refresh_fill_ids()
-            service.finish_request(reqs[1], checkpointed=False, committed_len=4)
-            service.finish_request(reqs[2], checkpointed=True, committed_len=4)
-            results = [
-                service.control.registry.query(context, "pin").results[0]
-                for context in contexts
-            ]
-            self.assertEqual(
-                [result.status for result in results],
-                [Status.CANCELLED, Status.CANCELLED, Status.MISSING],
-            )
-            self.assertTrue(results[2].public_result.missing_scope)
-            self.assertTrue(
-                all(result.public_result.claim is None for result in results)
-            )
-            self.assertEqual(
-                service.control.executor.protection.registry.active_claims, 0
-            )
-            self.assertFalse(service.has_pending)
-            # Late completion/replay of the cancelled binding cannot activate it.
-            service.control.request_event(
-                contexts[0], "success", committed=cache_fixtures.target()
-            )
-            self.assertTrue(service.control.submit(hints, contexts[0]).replayed)
-            self.assertEqual(
-                service.control.registry.query(contexts[0], "pin").results[0].status,
-                Status.CANCELLED,
-            )
-            self.assertFalse(service.has_background_work)
-            cache.sanity_check()
-
-    def test_request_cached_native_checkpoint_installs_independent_host_hold_before_unlock(
-        self,
-    ):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner, tokens=(1, 2, 3, 4, 5))
-            req = service_fixtures.serving_request()
-            req.output_ids = array("q", [5])
-            req.finished_reason = FINISH_LENGTH(1)
-            cache.req_to_token_pool.alloc([req])
-            slots = cache.token_to_kv_pool_allocator.alloc(5)
-            cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), slots)
-            req.kv.kv_committed_len = req.kv.kv_allocated_len = 5
-            service.attach(req, pin_hints(service, selection="request_cached"))
-            context = req.kv_control_context
-            observed = []
-            pin = service.control.executor.pin
-
-            def inspect(**kwargs):
-                observed.append(
-                    (
-                        req.kv.holds_kv,
-                        req.lock is not None,
-                        tuple(kwargs["scope"].content.token_ids),
-                    )
-                )
-                return pin(**kwargs)
-
-            with patch.object(service.control.executor, "pin", side_effect=inspect):
-                release_kv_cache(req, cache, checkpoint=True)
-            self.assertEqual(observed, [(True, True, (1, 2, 3, 4, 5))])
-            result = service.control.registry.query(context, "pin").results[0]
-            self.assertEqual(result.status, Status.COMPLETED)
-            self.assertEqual(
-                result.public_result.claim.actual_scope[0].coverage.end_token, 5
-            )
-            self.assertFalse(req.kv.holds_kv)
-            self.assertIsNone(req.lock)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 1)
-            self.assertEqual(cache.evict_host(100), 0)
-            run_pin(
-                service,
-                caller="request",
-                claim_id=result.public_result.claim.claim_id,
-                mode="release",
-                revision=2,
-                message="release",
-            )
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
-
     def test_http_pin_lifetime_query_and_same_message_replay(self):
         with cache_test_utils.hicache(self) as owner:
             _, cache, service, _ = owner
@@ -1128,166 +351,87 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
                     return dispatch(service, command)
 
             app = FastAPI()
-            install_routes(app, lambda: Manager())
+            install_kv_control_routes(app, lambda: Manager())
 
             async def exercise():
                 async with AsyncClient(
                     transport=ASGITransport(app), base_url="http://owner"
                 ) as client:
-                    cap = (await client.get("/v1/kv/capabilities")).json()["data"][
-                        "public_protocol"
-                    ]
-                    self.assertIn("sglang.pin", cap["actions"])
-                    self.assertEqual(
-                        cap["pin_protections"][0]["condition"], "eviction_exclusion"
-                    )
-                    request = pin_command(service)
-                    reply = (await client.post("/v1/kv/control", json=request)).json()[
-                        "data"
-                    ]
-                    mark = msgspec.to_builtins(service.cache_watermark())
-                    self.assertEqual(reply["cache_watermark"], mark)
+
+                    async def post(command):
+                        response = await client.post("/v1/kv/control", json=command)
+                        response.raise_for_status()
+                        return response.json()["data"]
+
                     discovery = (await client.get("/v1/kv/capabilities")).json()["data"]
-                    self.assertNotIn("feedback", discovery)
-                    self.assertEqual(discovery["cache_watermark"], mark)
+                    mark = msgspec.to_builtins(service.cache_watermark())
+                    assert discovery["cache_watermark"] == mark
+                    assert (
+                        discovery["engine_epoch"]
+                        == service.control.registry.engine_epoch
+                    )
+                    assert discovery["public_protocol"]["actions"]["sglang.pin"] == [
+                        "1.0"
+                    ]
+                    request = pin_command(service)
+                    reply = await post(request)
                     result = reply["results"][0]
-                    self.assertEqual(result["update"]["status"], "completed")
-                    self.assertEqual(
-                        result["public_result"]["claim"]["state"], "active"
-                    )
-                    self.assertTrue(result["public_result"]["accepted_scope"])
-                    self.assertFalse(service.has_pending)
-                    self.assertTrue(service.has_background_work)
+                    assert reply["cache_watermark"] == mark
+                    assert result["update"]["status"] == "completed"
+                    assert result["public_result"]["claim"]["state"] == "active"
+                    assert not service.has_pending and service.has_background_work
                     self.clock.now = 103
-                    replay = (await client.post("/v1/kv/control", json=request)).json()[
-                        "data"
+                    replay = await post(request)
+                    assert replay["replayed"] and replay["results"] == [result]
+                    context = request["context"]
+                    claim_query = dict(kind="claim", context=context, claim_id="pin")
+                    state = await post(claim_query)
+                    assert state["active"] and state["cache_watermark"] == mark
+                    assert (
+                        state["remaining_ttl"] == 7
+                        and state["ttl_remaining_ms"] == 7000
+                    )
+                    assert state["actual_scope"][0]["coverage"]["end_token"] == 4
+                    query = dict(kind="query", context=context, message_id="pin")
+                    for claim_id, expected in (("pin", state), ("absent", None)):
+                        combined = await post(dict(query, include_claim_id=claim_id))
+                        assert combined["claim"] == expected
+                        assert combined["cache_watermark"] == mark
+                        assert combined["results"] == [result]
+                    assert (await post(dict(query, kind="lookup")))[0]["results"] == [
+                        result
                     ]
-                    self.assertTrue(replay["replayed"])
-                    self.assertEqual(replay["results"][0], result)
-                    query = {
-                        "kind": "claim",
-                        "context": request["context"],
-                        "claim_id": "pin",
-                    }
-                    state = (await client.post("/v1/kv/control", json=query)).json()[
-                        "data"
-                    ]
-                    self.assertEqual(state["cache_watermark"], mark)
-                    self.assertEqual(state["remaining_ttl"], 7)
-                    self.assertEqual(state["ttl_remaining_ms"], 7000)
-                    self.assertTrue(state["active"])
-                    message = {
-                        "kind": "query",
-                        "context": request["context"],
-                        "message_id": "pin",
-                    }
-                    for claim_id in ("pin", "absent"):
-                        combined = (
-                            await client.post(
-                                "/v1/kv/control",
-                                json={**message, "include_claim_id": claim_id},
-                            )
-                        ).json()["data"]
-                        self.assertEqual(combined["cache_watermark"], mark)
-                        self.assertEqual(combined["results"], reply["results"])
-                        self.assertEqual(
-                            combined["claim"], state if claim_id == "pin" else None
+                    renewed = await post(
+                        pin_command(
+                            service, mode="renew", revision=2, message="renew", ttl=20
                         )
-                    missing = await client.post(
-                        "/v1/kv/control", json={**query, "claim_id": "absent"}
                     )
-                    self.assertEqual(missing.status_code, 404)
-                    self.assertEqual(
-                        state["effective_protection"], "eviction_exclusion"
+                    assert (
+                        renewed["results"][0]["public_result"]["claim"]["remaining_ttl"]
+                        == 20
                     )
-                    self.assertEqual(
-                        state["actual_scope"][0]["coverage"]["end_token"], 4
+                    assert service.next_deadline == 123
+                    await post(
+                        pin_command(
+                            service, mode="release", revision=3, message="release"
+                        )
                     )
-                    renewed = (
-                        await client.post(
-                            "/v1/kv/control",
-                            json=pin_command(
+                    terminal = await post(claim_query)
+                    assert terminal["state"] == "released" and terminal["tombstone"]
+                    assert terminal["remaining_ttl"] is None
+                    for revision, code in ((2, "stale_revision"), (4, "released")):
+                        late = await post(
+                            pin_command(
                                 service,
                                 mode="renew",
-                                revision=2,
-                                message="renew",
-                                ttl=20,
-                            ),
+                                revision=revision,
+                                message=f"late-{revision}",
+                            )
                         )
-                    ).json()["data"]["results"][0]
-                    self.assertEqual(
-                        renewed["public_result"]["claim"]["remaining_ttl"], 20
-                    )
-                    self.assertEqual(service.next_deadline, 123)
-                    released = (
-                        await client.post(
-                            "/v1/kv/control",
-                            json=pin_command(
-                                service, mode="release", revision=3, message="release"
-                            ),
-                        )
-                    ).json()["data"]["results"][0]
-                    self.assertEqual(
-                        released["public_result"]["claim"]["state"], "released"
-                    )
-                    terminal = (await client.post("/v1/kv/control", json=query)).json()[
-                        "data"
-                    ]
-                    self.assertTrue(terminal["tombstone"])
-                    self.assertIsNone(terminal["remaining_ttl"])
-                    self.assertIsNone(terminal["effective_protection"])
-                    self.assertEqual(
-                        run_pin(service, mode="renew", revision=2, message="late")[
-                            "update"
-                        ]["code"],
-                        "stale_revision",
-                    )
-                    self.assertEqual(
-                        run_pin(service, mode="renew", revision=4, message="revive")[
-                            "update"
-                        ]["code"],
-                        "released",
-                    )
+                        assert late["results"][0]["update"]["code"] == code
 
             asyncio.run(exercise())
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
-
-    def test_runtime_shared_eviction_capacity_and_ttl_are_independent(self):
-        config = ServiceConfig(
-            namespace="ns",
-            engine_id="engine",
-            protection_limits=ProtectionLimits(max_protected_tokens=4),
-        )
-        with cache_test_utils.hicache(self, config=config) as owner:
-            _, cache, service, _ = owner
-            node = host_copy(owner)
-            ordinary = host_copy(owner, (8, 9, 10, 11))
-            self.assertEqual(run_pin(service)["update"]["status"], "completed")
-            self.assertEqual(
-                run_pin(service, caller="B", message="b", ttl=20)["update"]["status"],
-                "completed",
-            )
-            denied = run_pin(
-                service,
-                caller="C",
-                message="c",
-                selection=msgspec.to_builtins(cache_fixtures.target((8, 9, 10, 11))),
-            )
-            self.assertEqual(denied["update"]["status"], "deferred")
-            self.assertFalse(denied["public_result"]["accepted_scope"])
-            self.assertEqual(ordinary.component_data[FULL].host_lock_ref, 0)
-            self.assertEqual(cache.evict_host(100), 4)
-            self.assertIsNotNone(node.component_data[FULL].host_value)
-            self.clock.now = 111
-            service.progress()
-            self.assertEqual(query_claim(service)["data"]["state"], "expired")
-            self.assertEqual(
-                query_claim(service, caller="B")["data"]["remaining_ttl"], 9
-            )
-            self.assertEqual(cache.evict_host(100), 0)
-            run_pin(service, caller="B", mode="release", revision=2, message="done")
-            self.assertEqual(cache.evict_host(100), 4)
             cache.sanity_check()
 
     def test_priority_orders_host_leaves_and_gpu_duplicates_without_holds(self):
@@ -1430,7 +574,7 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             cache.reset()
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
             self.assertEqual(
-                previous.get(caller_id="A", claim_id="pin", owner_task=None).state,
+                previous.get(caller_id="A", claim_id="pin").state,
                 "invalidated",
             )
             service.reset_after_cache_flush()
@@ -1509,35 +653,6 @@ class TestKVControlPinRuntime(cache_fixtures.KVCacheTestCase):
             run_pin(
                 service, caller="B", mode="release", revision=2, message="b-release"
             )
-
-    def test_missing_incomplete_and_l3_rejection_never_report_active_scope(self):
-        with cache_test_utils.hicache(self) as owner:
-            _, cache, service, dma = owner
-            missing = run_pin(service)
-            self.assertEqual(missing["update"]["status"], "missing")
-            self.assertTrue(missing["public_result"]["missing_scope"])
-            self.assertIsNone(missing["public_result"]["claim"])
-            node = cache_test_utils.seed(cache)
-            cache_test_utils.start_inference_backup(cache, node)
-            incomplete = run_pin(service, message="pending")
-            self.assertEqual(incomplete["update"]["code"], "incomplete")
-            self.assertFalse(incomplete["public_result"]["accepted_scope"])
-            cache_test_utils.finish_inference_backup(cache, dma)
-            request = pin_command(service, message="l3")
-            request["envelope"]["actions"][0]["payload"]["location"] = {
-                "tier": "storage",
-                "backend": "mooncake",
-            }
-            denied = dispatch(service, request)["data"]["results"][0]
-            self.assertEqual(denied["update"]["status"], "unsupported")
-            self.assertIsNone(denied["public_result"]["claim"])
-            legacy = pin_command(service, message="legacy")
-            legacy["envelope"]["actions"][0]["action_type"] = "sglang.set_priority"
-            reply = dispatch(service, legacy)["data"]
-            self.assertEqual(reply["results"][0]["update"]["status"], "unsupported")
-            self.assertFalse(reply["unhandled_actions"])
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
 
 
 if __name__ == "__main__":

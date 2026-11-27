@@ -1,4 +1,4 @@
-# Session-aware KV cache control
+# Engine KV cache control
 
 Native KV control is disabled by default. It lets a caller use three versioned
 actions:
@@ -9,10 +9,9 @@ actions:
 | `sglang.prefetch` | Read KV from storage (L3) into host memory (L2), keeping the storage copy. |
 | `sglang.demote` | Preserve host KV (L2) in storage (L3), then reclaim the eligible host range. |
 
-The [Router orchestrator](../../../../../sgl-router/KV_ORCHESTRATION.md) uses
-these actions for application task and tool events. The executing Engine owns
-the allocation, transfer, and reference checks. Query actual target coverage
-and protection state before treating a receipt as proof of readiness.
+A router can submit these actions for application task and tool events. The
+Engine owns allocation, transfer, and reference checks. Query actual target
+coverage and protection state before treating a receipt as proof of readiness.
 
 ## Configuration
 
@@ -67,19 +66,15 @@ Use the Engine ID, epoch and namespace returned by discovery in every command:
 }
 ```
 
-HTTP inference requests carrying version 1.0 PIN, PREFETCH, or DEMOTE actions
-require the configured admin credential. Use the admin bearer in `Authorization`
-on an admin-key-only server. When inference also requires a separate user key,
-send the user bearer in `Authorization` and the admin bearer in
-`X-SGLang-Admin-Authorization`. Other action names and versions pass through to
-their backend consumers. Standalone control submissions return an `unsupported`
-result for each unrecognized `sglang.*` name or version.
+The standalone endpoints use the admin bearer in `Authorization` when an admin
+key is configured. Inference retains opaque backend hints through `kv_hints`.
+Standalone control returns an `unsupported` receipt for an unrecognized
+`sglang.*` action or version.
 
-Use a target that matches the worker's page size, layout and cache salt. A PIN
-requires an already published host copy; it does not copy missing data. An
-attached PIN targeting `"request_cached"` binds only after successful request
-completion and cache checkpointing. Its scope ends at the last full page within
-the committed prefix and the configured token budget (at most 65,536 tokens).
+Use `kind: "tokens"` with a namespace and token IDs, or `kind: "prefix"` with
+the compatibility fields from discovery and all tokens through the end of the
+prefix. The Engine applies its namespace to the supplied logical cache salt.
+PIN requires an already published host copy.
 
 Acquiring or renewing a PIN requires `ttl_seconds`, `priority`, or both.
 TTL starts on the Engine after it holds the host pages. The optional signed
@@ -90,9 +85,9 @@ and keeps any assigned priority. Renewal updates only supplied fields;
 release supplies neither. Eviction invalidates the claim before slots can be
 reused. The claim view reports its own priority and any remaining hard TTL.
 
-Revisions increase within each claim. A new claim ID can start at revision 1
+Revisions increase within each `(caller_id, claim_id)` pair. A new claim ID can start at revision 1
 even after the retired history fills. The Engine checks replays against active
-claims and the most recent `max_records` retired claims. Once a terminal record
+claims and the most recent `max_records` retired claims (4,096 by default). Once a terminal record
 leaves that FIFO, the Engine treats its claim ID as unseen.
 
 Capabilities, submission, query, claim, and residency replies carry the current
@@ -100,6 +95,7 @@ cache watermark. Pass `include_claim_id` with a message query to read its live
 claim state in the same reply. `cancel` drains worker access before
 releasing resources. Acknowledge with `ack` once the operation is quiescent. An
 identical message can be replayed within the retention window; a changed payload
-with the same identity is rejected. Capacity refusal preserves the inference
+with the same identity is rejected. Use `lookup` to find a message by its caller and
+message ID. Capacity refusal preserves the inference
 request's normal recovery path. DEMOTE can confirm preservation and report
 that a source range is blocked by a live GPU copy, reference, or PIN.

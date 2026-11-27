@@ -17,9 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
-from functools import cached_property
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
 
@@ -295,31 +293,7 @@ HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 STORAGE_STOP_JOIN_S = 60.0
 
 
-class PrefetchCancellation:
-    """Shared termination state for ordinary and hybrid storage readers."""
-
-    _prefetch_buffer = None
-
-    def __init__(self, *args, **kwargs):
-        self._lock = threading.Lock()
-        self._terminated_flag = False
-        super().__init__(*args, **kwargs)
-
-    def mark_terminate(self):
-        with self._lock:
-            self._terminated_flag = True
-        # The queue checks the flag on insertion. Notify it for cancellation
-        # after insertion, without holding the operation lock across its mutex.
-        buffer = self._prefetch_buffer
-        if buffer is not None:
-            buffer.prioritize_cancelled(self)
-
-    def is_terminated(self) -> bool:
-        with self._lock:
-            return self._terminated_flag
-
-
-class PrefetchOperation(PrefetchCancellation, StorageOperation):
+class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
@@ -329,35 +303,20 @@ class PrefetchOperation(PrefetchCancellation, StorageOperation):
     ):
         self.request_id = request_id
 
+        self._lock = threading.Lock()
+        self._terminated_flag = False
         self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
         super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
+    def mark_terminate(self):
+        with self._lock:
+            self._terminated_flag = True
 
-class _PrefetchBuffer(Queue):
-    """Drain cancelled reads before live I/O for a single storage participant."""
-
-    def _init(self, maxsize):
-        self.queue = OrderedDict()
-
-    def _put(self, operation):
-        self.queue[operation] = None
-        if operation is not None:
-            operation._prefetch_buffer = self
-            if operation.is_terminated():
-                self.queue.move_to_end(operation, last=False)
-
-    def prioritize_cancelled(self, operation):
-        with self.mutex:
-            if operation in self.queue:
-                self.queue.move_to_end(operation, last=False)
-
-    def _get(self):
-        operation, _ = self.queue.popitem(last=False)
-        if operation is not None:
-            operation._prefetch_buffer = None
-        return operation
+    def is_terminated(self) -> bool:
+        with self._lock:
+            return self._terminated_flag
 
 
 def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
@@ -587,10 +546,7 @@ class HiCacheController:
 
         self.prefetch_queue = Queue()
         self.backup_queue = Queue()
-        # Collective ACKs require identical operation order across participants.
-        self.prefetch_buffer = (
-            Queue() if self.prefetch_completion_sync_groups else _PrefetchBuffer()
-        )
+        self.prefetch_buffer = Queue()
         self.prefetch_sync_queue = Queue()
         self.prefetch_hit_queue = Queue()
         self.ack_prefetch_queue = Queue()
@@ -601,8 +557,6 @@ class HiCacheController:
     def _start_storage_worker_threads(self) -> None:
         """Create and start the four storage workers; their queues must exist.
         The IO worker starts before the sync thread, which reads its handle."""
-        # Create the shared counters before either worker can update them.
-        _ = self.storage_read_stats
         self._storage_worker_failures = {}
         self.prefetch_thread = self._start_storage_worker(
             "hicache-prefetch", self.prefetch_thread_func
@@ -1382,34 +1336,6 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
-    @cached_property
-    def storage_read_stats(self):
-        # Query and GET each have a single writer thread and separate keys.
-        # Samples are cumulative local observations, not a TP-reduced snapshot.
-        return dict(
-            query_jobs=0,
-            query_seconds=0.0,
-            get_batches=0,
-            get_requested_tokens=0,
-            get_completed_tokens=0,
-            get_seconds=0.0,
-        )
-
-    def storage_read_stats_snapshot(self):
-        """All ordinary/native reads; bytes describe anchor KV API payload only.
-
-        Sidecar traffic and backend retries are not observed here. In particular,
-        these counters do not measure physical network traffic or wire bytes.
-        """
-        stats = self.storage_read_stats.copy()
-        for kind in ("requested", "completed"):
-            stats[f"get_{kind}_bytes"] = (
-                stats[f"get_{kind}_tokens"] * self.storage_host_pool.size_per_token
-            )
-        return {"storage_read_" + key: value for key, value in stats.items()} | {
-            "storage_read_wire_bytes": None,
-        }
-
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
@@ -1525,17 +1451,9 @@ class HiCacheController:
         Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
         """
         # Read from KV pool.
-        stats = self.storage_read_stats
-        stats["get_batches"] += 1
-        stats["get_requested_tokens"] += len(batch_hashes) * self.page_size
-        started = time.monotonic()
-        try:
-            kv_hits = self.page_get_func(
-                operation, batch_hashes, batch_host_indices, extra_info
-            )
-            stats["get_completed_tokens"] += kv_hits * self.page_size
-        finally:
-            stats["get_seconds"] += time.monotonic() - started
+        kv_hits = self.page_get_func(
+            operation, batch_hashes, batch_host_indices, extra_info
+        )
 
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
@@ -1703,16 +1621,7 @@ class HiCacheController:
                 if operation.is_terminated() or self.storage_stop_event.is_set():
                     hash_value, storage_hit_count = [], 0
                 else:
-                    started = time.monotonic()
-                    self.storage_read_stats["query_jobs"] += 1
-                    try:
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
-                        )
-                    finally:
-                        self.storage_read_stats["query_seconds"] += (
-                            time.monotonic() - started
-                        )
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
             except Exception:
                 logger.exception(
                     "HiCache storage query failed for request %s",

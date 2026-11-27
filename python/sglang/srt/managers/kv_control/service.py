@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 import time
 import uuid
+from functools import wraps
 from typing import Annotated
 
 import msgspec
-
+from sglang.srt.managers.io_struct import KVControlReqInput, KVControlReqOutput
 from sglang.srt.managers.kv_control.contracts import (
-    MAX_SCOPE_TOKENS,
     CacheWatermark,
     ControlContext,
     ControlError,
@@ -21,16 +22,16 @@ from sglang.srt.managers.kv_control.contracts import (
     Location,
     OperationRef,
     Position,
-    PublicLocation,
-    PublicTarget,
-    TaskIdentity,
     TokensTarget,
     Value,
-    is_native_action,
     resolve_prefix,
     validated,
 )
 from sglang.srt.managers.kv_control.controller import KVControl
+from sglang.srt.managers.kv_control.key_namespace import (
+    SALT_ENCODING,
+    encode_cache_salt,
+)
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.unified_cache.control_protection import (
     HostCacheProtection,
@@ -150,12 +151,6 @@ class Residency(Value, tag="residency", tag_field="kind"):
     location: Location = Location(tier="gpu")
 
 
-class StorageTargets(Value, tag="storage_targets", tag_field="kind"):
-    context: ControlContext
-    target: PublicTarget
-    location: PublicLocation
-
-
 class Capacity(Value, tag="capacity", tag_field="kind"):
     context: ControlContext
 
@@ -163,7 +158,6 @@ class Capacity(Value, tag="capacity", tag_field="kind"):
 class Claim(Value, tag="claim", tag_field="kind"):
     context: ControlContext
     claim_id: Identifier
-    owner_task: TaskIdentity | None = None
 
 
 class ClaimEvents(Value, tag="claim_events", tag_field="kind"):
@@ -180,7 +174,6 @@ Command = (
     | Ack
     | Cancel
     | Residency
-    | StorageTargets
     | Capacity
     | Claim
     | ClaimEvents
@@ -207,7 +200,6 @@ class KVControlService:
         self.tp_group = tp_group
         self.tp_size = 1
         self.tp_time: float | None = None
-        self._request_sequence = 0
         engine_id, epoch = config.engine_id or uuid.uuid4().hex, None
         self.key_namespace = config.namespace
         if tp_group is not None:
@@ -308,27 +300,9 @@ class KVControlService:
         return executor
 
     def cache_salt(self, original):
-        from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
-
         return encode_cache_salt(self.key_namespace, original)
 
-    def prepare_request(self, req):
-        if not self.namespace_keys:
-            return
-        if hasattr(req, "kv_control_logical_cache_salt"):
-            if req.kv_control_key_namespace != self.config.namespace:
-                raise ControlError(
-                    "stale_epoch", "Request key belongs to an older model namespace"
-                )
-            return
-        original = req.cache_salt
-        encoded = self.cache_salt(original)
-        req.kv_control_logical_cache_salt = original
-        req.kv_control_key_namespace = self.config.namespace
-        req.cache_salt = encoded
-
     def capabilities(self):
-        from sglang.srt.managers.kv_control.key_namespace import SALT_ENCODING
         from sglang.srt.managers.kv_control.public import public_capabilities
 
         registry = self.control.registry
@@ -346,7 +320,6 @@ class KVControlService:
             if self.tp_group is not None
             else "single_owner",
             "tp_size": self.tp_size,
-            "attached_caller_id": "request",
             "weight_updates": "unsupported",
             "cache_salt_namespace": self.key_namespace if self.namespace_keys else None,
             "cache_salt_encoding": SALT_ENCODING
@@ -401,80 +374,9 @@ class KVControlService:
         self.control.executor = self._bind_executor()
         self.control.registry.cache_watermark = self.cache_watermark
 
-    def attach(self, req, envelope, *, unsupported_request=False):
-        if envelope is None or not any(is_native_action(a) for a in envelope.actions):
-            return
-        context = getattr(req, "kv_control_context", None)
-        if (
-            context is None
-            or context.engine_epoch != self.control.registry.engine_epoch
-        ):
-            self._request_sequence += 1
-            context = self.control.context(
-                "request", binding_id=str(self._request_sequence)
-            )
-        # The request retains only a context, never registry/worker objects. A
-        # reused rid or another sample gets a different incarnation.
-        unsupported = unsupported_request or (
-            getattr(req, "session", None) is not None and req.session.streaming
-        )
-        unsupported |= getattr(req, "lora_id", None) is not None
-        unsupported |= getattr(req, "multimodal_inputs", None) is not None
-        # Refuse this request's physical work without removing the owner that
-        # must still cancel/drain existing transfers on logical task cleanup.
-        submission = self.control.submit(
-            envelope, context, execute_primitives=not unsupported
-        )
-        req.kv_control_context = context
-        req.kv_hints = msgspec.structs.replace(
-            envelope, actions=list(submission.unhandled_actions)
-        )
-
-    def finish_request(
-        self, req, *, committed_len=0, checkpointed=False, aborted=False
-    ):
-        context = getattr(req, "kv_control_context", None)
-        if context is None or not (aborted or req.finished()):
-            return
-        req.kv_control_context = None
-        if context.engine_epoch != self.control.registry.engine_epoch:
-            return
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
-        success = (
-            not aborted
-            and checkpointed
-            and req.finished()
-            and not isinstance(req.finished_reason, FINISH_ABORT)
-        )
-        committed = None
-        if success and committed_len > 0:
-            page_size = self.cache.tree_core.page_size
-            committed_len = min(
-                committed_len,
-                len(req.full_untruncated_fill_ids),
-                MAX_SCOPE_TOKENS,
-                self.config.limits.max_scope_tokens,
-            )
-            committed_len -= committed_len % page_size
-        if success and committed_len > 0:
-            committed = TokensTarget(
-                namespace=self.config.namespace,
-                token_ids=tuple(req.full_untruncated_fill_ids[:committed_len]),
-                cache_salt=getattr(
-                    req, "kv_control_logical_cache_salt", req.cache_salt
-                ),
-                extra_key=req.extra_key,
-                is_multimodal=req.multimodal_inputs is not None,
-                allow_clip=True,
-            )
-        self.control.request_event(
-            context, "success" if success else "abort", committed=committed
-        )
-
-    def _claim_view(self, caller_id, claim_id, owner_task):
+    def _claim_view(self, caller_id, claim_id):
         claim = self.control.executor.protection.get(
-            caller_id=caller_id, claim_id=claim_id, owner_task=owner_task
+            caller_id=caller_id, claim_id=claim_id
         )
         return {
             **msgspec.to_builtins(claim),
@@ -497,19 +399,7 @@ class KVControlService:
             command.ref.context if isinstance(command, Cancel) else command.context
         )
         registry.validate_context(context)
-        if isinstance(command, StorageTargets):
-            if command.target == "request_cached" or command.location.tier != "storage":
-                raise ControlError(
-                    "invalid_payload",
-                    "Storage descriptions require a definite target and storage location",
-                )
-            return control.executor.storage_targets(command.target, command.location)
         if isinstance(command, Submit):
-            if context.binding_id is not None:
-                raise ControlError(
-                    "invalid_payload",
-                    "Independent submission cannot bind an inference request",
-                )
             # Independent control has no external consumer. Opaque actions
             # remain in the reply for their owner to handle.
             submission = control.submit(command.envelope, context)
@@ -522,19 +412,9 @@ class KVControlService:
             reply = msgspec.to_builtins(submission)
             protection = control.executor.protection
             if command.include_claim_id is not None and protection is not None:
-                owner = next(
-                    (
-                        claim.owner_task
-                        for result in submission.results
-                        if result.public_result is not None
-                        and (claim := result.public_result.claim) is not None
-                        and claim.claim_id == command.include_claim_id
-                    ),
-                    None,
-                )
                 try:
                     reply["claim"] = self._claim_view(
-                        context.caller_id, command.include_claim_id, owner
+                        context.caller_id, command.include_claim_id
                     )
                 except ControlError as error:
                     if error.code != "missing":
@@ -557,9 +437,7 @@ class KVControlService:
                     "Claim queries require an independent caller context",
                 )
             if isinstance(command, Claim):
-                return self._claim_view(
-                    context.caller_id, command.claim_id, command.owner_task
-                )
+                return self._claim_view(context.caller_id, command.claim_id)
             return protection.changes(
                 caller_id=context.caller_id,
                 after_sequence=command.after_sequence,
@@ -609,3 +487,87 @@ def dispatch(service, data):
                 "reason": str(error)[:512],
             },
         }
+
+
+def create_scheduler_service(cache):
+    from sglang.srt.runtime_context import get_memory, get_parallel
+
+    if get_memory().kv_control_config is None:
+        return None
+    parallel = get_parallel()
+    return KVControlService(
+        cache,
+        runtime_config(),
+        namespace_keys=True,
+        tp_group=parallel.tp_group.cpu_group if parallel.tp_size > 1 else None,
+    )
+
+
+def scheduler_control_handler(service):
+    def handle(request):
+        return KVControlReqOutput(
+            request_id=request.request_id, result=dispatch(service, request.command)
+        )
+
+    return handle
+
+
+def namespace_cache_salt(service, req):
+    if service is not None and service.namespace_keys:
+        try:
+            req.cache_salt = service.cache_salt(req.cache_salt)
+        except ControlError as error:
+            req.set_finish_with_abort(str(error), status_code=400)
+
+
+def sleep_on_idle(sleeper, service):
+    deadline = service.next_deadline if service is not None else None
+    if deadline is None:
+        sleeper.maybe_sleep()
+    else:
+        timeout_ms = max(0, min(1000, math.ceil((deadline - time.monotonic()) * 1000)))
+        sleeper.maybe_sleep(timeout_ms=timeout_ms)
+
+
+def requires_mutable_weights(response_type):
+    return _requires_uncontrolled_cache(
+        response_type, "KV control requires fixed model weights"
+    )
+
+
+def requires_resident_memory(response_type):
+    return _requires_uncontrolled_cache(
+        response_type, "KV control requires resident model and cache memory"
+    )
+
+
+def _requires_uncontrolled_cache(response_type, message):
+    def decorate(function):
+        @wraps(function)
+        def wrapped(self, recv_req):
+            if getattr(self.scheduler, "kv_control_service", None) is not None:
+                return response_type(success=False, message=message)
+            return function(self, recv_req)
+
+        return wrapped
+
+    return decorate
+
+
+async def send_tokenizer_control(manager, command):
+    from sglang.srt.runtime_context import get_parallel
+
+    manager.auto_create_handle_loop()
+    parallel = get_parallel()
+    if parallel.num_dp_ranks != 1 or parallel.pp_size != 1:
+        return {
+            "success": False,
+            "error": {
+                "code": "unsupported",
+                "reason": "KV control requires one TP group",
+            },
+        }
+    response = await manager.kv_control_communicator(
+        KVControlReqInput(request_id=uuid.uuid4().hex, command=command)
+    )
+    return response[0].result

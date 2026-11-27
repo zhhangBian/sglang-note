@@ -9,7 +9,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.communicator import FanOutCommunicator
@@ -49,7 +48,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
-    KVControlReqInput,
     KVControlReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
@@ -213,19 +211,9 @@ class TokenizerControlMixin:
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
     async def kv_control(self: TokenizerManager, command: Dict[str, Any]):
-        self.auto_create_handle_loop()
-        if get_parallel().num_dp_ranks != 1 or get_parallel().pp_size != 1:
-            return {
-                "success": False,
-                "error": {
-                    "code": "unsupported",
-                    "reason": "KV control requires one TP group",
-                },
-            }
-        response = await self.kv_control_communicator(
-            KVControlReqInput(request_id=uuid.uuid4().hex, command=command)
-        )
-        return response[0].result
+        from sglang.srt.managers.kv_control.service import send_tokenizer_control
+
+        return await send_tokenizer_control(self, command)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (

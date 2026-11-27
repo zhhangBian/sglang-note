@@ -15,12 +15,10 @@ from itertools import islice
 from typing import TYPE_CHECKING, Literal
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     ControlError,
     Priority,
     TargetOutcome,
-    TaskIdentity,
     validated,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -42,20 +40,16 @@ def _identifier(value: str, name: str) -> None:
 
 def _revision(value: int) -> None:
     if type(value) is not int or not 0 <= value <= _MAX_INTEGER:
-        raise ControlError("invalid", "Revision/incarnation must be a bounded integer")
+        raise ControlError("invalid", "Revision must be a bounded integer")
 
 
 class ProtectionKey(msgspec.Struct, frozen=True, kw_only=True, order=True):
     caller_id: str
-    task_id: str
-    task_incarnation: int
     claim_id: str
 
     def __post_init__(self) -> None:
         _identifier(self.caller_id, "caller_id")
-        _identifier(self.task_id, "task_id")
         _identifier(self.claim_id, "claim_id")
-        _revision(self.task_incarnation)
 
 
 class HostPrefix(msgspec.Struct, frozen=True, kw_only=True):
@@ -83,7 +77,6 @@ class ProtectionSnapshot(msgspec.Struct, frozen=True, kw_only=True):
     namespace: str
     priority: int | None = None
     reason: str = ""
-    owner_task: TaskIdentity | None = None
     actual_scope: tuple[TargetOutcome, ...] = ()
 
 
@@ -412,6 +405,16 @@ class ProtectionRegistry:
                 self._physical_refs[page] = self._physical_refs.get(page, 0) + 1
         return holds, now
 
+    def _prepare_reservation(self, prepare):
+        replay, prepared = self._prepare_shards(prepare)
+        if replay is not None:
+            # A replay still participates in the reservation vote.
+            self._prepare_shards(lambda: None)
+            return replay, None
+        now, ttl, priority, record, fingerprint, spans, pages = prepared
+        holds, now = self._reserve(spans, pages, ttl, now)
+        return None, (now, ttl, priority, record, fingerprint, pages, holds)
+
     def _set_priority(self, record: _Record, priority: int | None):
         if record.snapshot.priority is None and priority is None:
             return
@@ -433,7 +436,6 @@ class ProtectionRegistry:
         key: ProtectionKey,
         revision: int,
         prefixes: tuple[HostPrefix, ...],
-        owner_task: TaskIdentity | None = None,
         actual_scope: tuple[TargetOutcome, ...] = (),
         ttl_seconds: float | None = None,
         priority: int | None = None,
@@ -468,13 +470,10 @@ class ProtectionRegistry:
                 pages,
             )
 
-        replay, prepared = self._prepare_shards(prepare)
+        replay, reserved = self._prepare_reservation(prepare)
         if replay is not None:
-            # Other ranks still participate in the reservation vote.
-            self._prepare_shards(lambda: None)
             return replay
-        now, ttl, priority, record, fingerprint, spans, pages = prepared
-        holds, now = self._reserve(spans, pages, ttl, now)
+        now, ttl, priority, record, fingerprint, pages, holds = reserved
         # Acquire the replacement first: an update never opens an eviction gap.
         if record is not None:
             self._drop_holds(record)
@@ -483,7 +482,6 @@ class ProtectionRegistry:
             key=key,
             revision=revision,
             state="active",
-            owner_task=owner_task,
             actual_scope=actual_scope,
             prefixes=prefixes,
             physical_tokens=len(pages) * self._core.page_size,
@@ -555,13 +553,10 @@ class ProtectionRegistry:
                 pages,
             )
 
-        replay, prepared = self._prepare_shards(prepare)
+        replay, reserved = self._prepare_reservation(prepare)
         if replay is not None:
-            # Other ranks still participate in the reservation vote.
-            self._prepare_shards(lambda: None)
             return replay
-        now, ttl, priority, record, fingerprint, spans, pages = prepared
-        holds, now = self._reserve(spans, pages, ttl, now)
+        now, ttl, priority, record, fingerprint, pages, holds = reserved
         if holds:
             record.holds = holds
         if priority is not None:
@@ -581,7 +576,6 @@ class ProtectionRegistry:
         *,
         key: ProtectionKey,
         revision: int,
-        owner_task: TaskIdentity | None = None,
     ) -> ProtectionSnapshot:
         self._check()
         _revision(revision)
@@ -597,7 +591,6 @@ class ProtectionRegistry:
                     key=key,
                     revision=revision,
                     state="released",
-                    owner_task=owner_task,
                     prefixes=(),
                     physical_tokens=0,
                     activated_at=None,
@@ -748,24 +741,6 @@ class ProtectionRegistry:
             self._expire(record, now)
             expired.append(record.snapshot)
         return tuple(expired)
-
-    def cleanup_task(
-        self, *, caller_id: str, task_id: str, task_incarnation: int
-    ) -> tuple[ProtectionSnapshot, ...]:
-        self._check()
-        _identifier(caller_id, "caller_id")
-        _identifier(task_id, "task_id")
-        _revision(task_incarnation)
-        retired = []
-        for key, record in list(self._records.items()):
-            if (key.caller_id, key.task_id, key.task_incarnation) == (
-                caller_id,
-                task_id,
-                task_incarnation,
-            ):
-                self._retire(record, state="released", reason="task_finished")
-                retired.append(record.snapshot)
-        return tuple(retired)
 
     def _invalidate(
         self, reason: str, *, release_holds: bool

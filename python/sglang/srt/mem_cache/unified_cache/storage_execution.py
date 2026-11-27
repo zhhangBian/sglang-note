@@ -2,8 +2,7 @@
 """Declared native storage execution profiles; I/O stays in HiCache workers.
 
 Adapters bind a concrete backend instance, physical layout and protection domain.
-Descriptions contain keys, never pointers or inferred residency. No network calls
-run on the cache owner thread.
+Storage namespace identity covers the backend key layout and configuration.
 """
 
 from __future__ import annotations
@@ -11,29 +10,14 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
-from typing import Protocol
 
 import msgspec
 import torch
-
 from sglang.srt.managers.kv_control.contracts import ControlError, Location
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile
 
 
-class StorageExecutionAdapter(Protocol):
-    backend: str
-    profile: str
-    backend_namespace: str
-    store: object
-    prefetch_paths: tuple[tuple[str, str], ...]
-    demote_paths: tuple[tuple[str, str], ...]
-
-    def describe_pages(self, hashes: list[str]) -> list[dict]: ...
-
-    def location(self) -> Location: ...
-
-
-class _Adapter:
+class StorageExecutionAdapter:
     prefetch_paths = (("storage", "host"),)
     demote_paths = (("host", "storage"),)
 
@@ -68,7 +52,7 @@ class _Adapter:
         )
 
 
-class FileExecutionAdapter(_Adapter):
+class FileExecutionAdapter(StorageExecutionAdapter):
     backend = "file"
     profile = "native_full_file_v1"
 
@@ -88,19 +72,8 @@ class FileExecutionAdapter(_Adapter):
         if store.metadata_cache is not None and store._unified_suffixes is None:
             self.demote_paths = ()
 
-    def describe_pages(self, hashes):
-        return [
-            {
-                "keys": [
-                    os.path.join(os.path.realpath(self.store.file_path), key + ".bin")
-                    for key in self.store._get_component_keys(h)
-                ]
-            }
-            for h in hashes
-        ]
 
-
-class MooncakeExecutionAdapter(_Adapter):
+class MooncakeExecutionAdapter(StorageExecutionAdapter):
     backend = "mooncake"
     profile = "tp1_full_mha_page_first_direct_v1"
 
@@ -134,8 +107,7 @@ class MooncakeExecutionAdapter(_Adapter):
             raise ControlError(
                 "unsupported", "Unsupported Mooncake physical page layout"
             )
-        self.tp_size = config.tp_size
-        self.object_sizes = sizes * self.tp_size
+        tp_size = config.tp_size
         c = store.config
         super().__init__(
             store,
@@ -144,11 +116,11 @@ class MooncakeExecutionAdapter(_Adapter):
                 c.master_server_address,
                 c.metadata_server,
                 c.tenant_id,
-                self._page_keys(store, "", self.tp_size) if self.tp_size > 1 else keys,
-                self.object_sizes,
+                self._page_keys(store, "", tp_size) if tp_size > 1 else keys,
+                sizes * tp_size,
             ),
         )
-        if self.tp_size > 1:
+        if tp_size > 1:
             self.profile = "tp_full_mha_page_first_direct_v1"
 
     @staticmethod
@@ -156,15 +128,6 @@ class MooncakeExecutionAdapter(_Adapter):
         key = store._tag_keys([hash_value])
         return [
             name for rank in range(tp_size) for name in store.mha_page_keys(key, rank)
-        ]
-
-    def describe_pages(self, hashes):
-        return [
-            {
-                "keys": self._page_keys(self.store, h, self.tp_size),
-                "object_bytes": list(self.object_sizes),
-            }
-            for h in hashes
         ]
 
 

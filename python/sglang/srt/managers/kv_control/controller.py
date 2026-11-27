@@ -6,10 +6,9 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Protocol
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import (
     PROTOCOL_VERSION,
     ControlContext,
@@ -23,7 +22,6 @@ from sglang.srt.managers.kv_control.contracts import (
     ResolvedTarget,
     Status,
     Submission,
-    TokensTarget,
     TransferPayload,
     Value,
     parse_action,
@@ -72,8 +70,8 @@ class Executor(Protocol):
 @dataclass
 class _Pending:
     ref: OperationRef
-    payload: TransferPayload | Pin
-    target: ResolvedTarget | None
+    payload: TransferPayload
+    target: ResolvedTarget
     started: bool = False
     cancel_sent: bool = False
     # Keep a bounded cause, never an exception/traceback retaining worker state.
@@ -105,20 +103,14 @@ class KVControl:
             engine_id, namespace, engine_epoch=engine_epoch, limits=limits, clock=clock
         )
         self._pending: dict[str, _Pending] = {}
-        # Attached actions acquire cache resources in submission order. A
-        # hash-dependent order could pick different victims on TP ranks.
-        self._requests: dict[tuple[str, str], dict[str, None]] = {}
 
-    def context(
-        self, caller_id: str, *, binding_id: str | None = None
-    ) -> ControlContext:
+    def context(self, caller_id: str) -> ControlContext:
         return self.registry.validate_context(
             ControlContext(
                 engine_id=self.registry.engine_id,
                 engine_epoch=self.registry.engine_epoch,
                 namespace=self.registry.namespace,
                 caller_id=caller_id,
-                binding_id=binding_id,
             )
         )
 
@@ -126,14 +118,12 @@ class KVControl:
         self,
         envelope: KvHintsEnvelope,
         context: ControlContext,
-        *,
-        execute_primitives: bool = True,
     ) -> Submission:
-        if type(execute_primitives) is not bool:
-            raise ControlError("invalid_payload", "Execution support must be a bool")
-        batch, unhandled = snapshot_envelope(
-            envelope, self.limits, request_attached=context.binding_id is not None
-        )
+        if context.binding_id is not None:
+            raise ControlError(
+                "invalid_payload", "Control submissions require an independent context"
+            )
+        batch, unhandled = snapshot_envelope(envelope, self.limits)
         if not batch.actions:
             return Submission(replayed=False, unhandled_actions=unhandled)
         submission = self.registry.reserve(batch, context)
@@ -156,7 +146,7 @@ class KVControl:
                         "JSON numbers must be finite and within the exact integer bound",
                     )
                 scope = None
-                if self.executor is None or not execute_primitives:
+                if self.executor is None:
                     raise ControlError(
                         "unsupported", "No cache executor for this request"
                     )
@@ -175,39 +165,23 @@ class KVControl:
                     )
                 # Renew/release use the claim identity, even after its prefix is gone.
                 if not isinstance(payload, Pin) or payload.mode == "acquire":
-                    if target == "request_cached":
-                        if context.binding_id is None:
-                            raise ControlError(
-                                "invalid_payload",
-                                "request_cached requires a request incarnation",
-                            )
-                    else:
-                        scope = resolve_prefix(target, context, self.limits)
+                    scope = resolve_prefix(target, context, self.limits)
                 prepared.append((payload, scope))
             except ControlError as error:
                 prepared.append(error)
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
-                if isinstance(payload, TransferPayload) or (
-                    isinstance(payload, Pin)
-                    and payload.mode == "acquire"
-                    and payload.target == "request_cached"
-                ):
+                if isinstance(payload, TransferPayload):
                     self._pending[result.ref.operation_id] = _Pending(
                         result.ref,
                         payload,
                         scope,
                         deadline=self._clock() + payload.timeout_ms / 1000
-                        if isinstance(payload, TransferPayload)
-                        and payload.timeout_ms is not None
+                        if payload.timeout_ms is not None
                         else None,
                     )
-                    self.registry.set_public_scope(
-                        result.ref,
-                        requested_outcomes(scope) if scope is not None else (),
-                        self.executor.capabilities().get("cache_generation"),
-                    )
+                    self._set_scope(result.ref, scope)
         for result, item in zip(submission.results, prepared):
             if self.registry.get(result.ref).status.terminal:
                 continue
@@ -215,116 +189,35 @@ class KVControl:
                 if isinstance(item, ControlError):
                     raise item
                 payload, scope = item
-                self._dispatch(result.ref, payload, scope)
+                if isinstance(payload, Pin):
+                    self._execute_pin(result.ref, payload, scope)
+                else:
+                    self._start(self._pending[result.ref.operation_id])
             except ControlError as error:
                 self._error(result.ref, error)
         return msgspec.structs.replace(
             self.registry.query(context, batch.message_id), unhandled_actions=unhandled
         )
 
-    def _dispatch(self, ref, payload, scope):
-        if payload.target == "request_cached" and (
-            not isinstance(payload, Pin) or payload.mode == "acquire"
-        ):
-            key = ref.context.caller_id, ref.context.binding_id
-            self._requests.setdefault(key, {})[ref.operation_id] = None
-            self.registry.update(
-                ref,
-                ExecutionUpdate(
-                    status=Status.QUEUED, quiescent=True, code="request_completion"
-                ),
-            )
-        elif isinstance(payload, Pin):
-            self._execute_pin(ref, payload, scope)
-        else:
-            self._start(self._pending[ref.operation_id])
+    def _set_scope(self, ref, scope):
+        self.registry.set_public_scope(
+            ref,
+            requested_outcomes(scope),
+            self.executor.capabilities().get("cache_generation"),
+        )
 
     def _execute_pin(self, ref, payload, scope):
         if scope is not None:
-            self.registry.set_public_scope(
-                ref,
-                requested_outcomes(scope),
-                self.executor.capabilities().get("cache_generation"),
-            )
+            self._set_scope(ref, scope)
         update, claim = self.executor.pin(ref=ref, payload=payload, scope=scope)
         self._finish(ref, update)
         if claim is not None:
             self.registry.set_public_claim(ref, claim)
 
-    def request_event(
-        self,
-        context: ControlContext,
-        event: Literal["success", "abort", "error", "preempt", "checkpoint"],
-        *,
-        committed: TokensTarget | None = None,
-    ) -> tuple[OperationResult, ...]:
-        """success must run before request references are released.
-
-        The owner supplies authoritative committed content for request_cached;
-        its executor acquires separate holds synchronously in start(). This core
-        never observes a live Req or guesses a generated suffix.
-        """
-        self.registry.validate_context(context)
-        if context.binding_id is None or event not in (
-            "success",
-            "abort",
-            "error",
-            "preempt",
-            "checkpoint",
-        ):
-            raise ControlError(
-                "invalid_payload", "Expected a request incarnation and lifecycle event"
-            )
-        if event in ("preempt", "checkpoint"):
-            return ()
-        key = context.caller_id, context.binding_id
-        ids = tuple(self._requests.pop(key, ()))
-        results = []
-        for operation_id in ids:
-            pending = self._pending[operation_id]
-            if event != "success":
-                results.append(
-                    self._finish(
-                        pending.ref,
-                        ExecutionUpdate(
-                            status=Status.CANCELLED,
-                            quiescent=True,
-                            code="request_failed",
-                        ),
-                    )
-                )
-                continue
-            try:
-                if pending.target is None:
-                    if committed is None:
-                        raise ControlError(
-                            "missing", "No committed request content supplied"
-                        )
-                    pending.target = resolve_prefix(committed, context, self.limits)
-                self._start(pending)
-            except ControlError as error:
-                self._error(pending.ref, error)
-            results.append(self.registry.get(pending.ref))
-        return tuple(results)
-
     def _start(self, pending):
-        assert self.executor is not None and pending.target is not None
-        if isinstance(pending.payload, Pin):
-            self._execute_pin(pending.ref, pending.payload, pending.target)
-            return
         if pending.deadline is not None and self._clock() >= pending.deadline:
             self.cancel(pending.ref)
             return
-        current = self.registry.get(pending.ref)
-        if (
-            current.public_result is not None
-            and not current.public_result.requested_scope
-        ):
-            self.registry.set_public_scope(
-                pending.ref,
-                requested_outcomes(pending.target),
-                self.executor.capabilities().get("cache_generation"),
-            )
         pending.started = True
         try:
             update = self.executor.start(
@@ -422,13 +315,16 @@ class KVControl:
             if isinstance(payload, Demote)
             else ("destination_ready",)
         )
+
+        def invalid_reclamation(steps):
+            return "source_reclaimed" in steps and (
+                not isinstance(payload, Demote)
+                or "destination_ready" not in steps
+                or steps.index("source_reclaimed") < steps.index("destination_ready")
+            )
+
         successful = []
-        if "source_reclaimed" in update.completed_steps and (
-            not isinstance(payload, Demote)
-            or "destination_ready" not in update.completed_steps
-            or update.completed_steps.index("source_reclaimed")
-            < update.completed_steps.index("destination_ready")
-        ):
+        if invalid_reclamation(update.completed_steps):
             raise ControlError(
                 "invalid_completion",
                 "Only DEMOTE can reclaim a source, after destination publication",
@@ -440,12 +336,7 @@ class KVControl:
                 )
             if not outcome.completed_steps:
                 continue
-            if "source_reclaimed" in outcome.completed_steps and (
-                not isinstance(payload, Demote)
-                or "destination_ready" not in outcome.completed_steps
-                or outcome.completed_steps.index("source_reclaimed")
-                < outcome.completed_steps.index("destination_ready")
-            ):
+            if invalid_reclamation(outcome.completed_steps):
                 raise ControlError(
                     "invalid_completion",
                     "Source reclamation requires destination publication",
@@ -507,12 +398,6 @@ class KVControl:
         result = self.registry.update(ref, update)
         if result.status.terminal:
             self._pending.pop(ref.operation_id, None)
-            key = ref.context.caller_id, ref.context.binding_id
-            ids = self._requests.get(key)
-            if ids is not None:
-                ids.pop(ref.operation_id, None)
-                if not ids:
-                    del self._requests[key]
         return result
 
     def _error(self, ref, error):

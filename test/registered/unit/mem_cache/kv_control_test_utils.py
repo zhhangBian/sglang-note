@@ -3,20 +3,22 @@
 
 import atexit
 import json
+import time
 from contextlib import contextmanager
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import msgspec
 import test_kv_control_cache as cache_fixtures
 import torch
-
+from sglang.srt.managers.kv_control.contracts import TokensTarget
 from sglang.srt.managers.kv_control.service import KVControlService, ServiceConfig
+from sglang.srt.managers.kv_hints import KvHintAction, KvHintsEnvelope
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.l2_transfer import TransferCompletion
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.runtime_context import get_context, get_parallel, get_server_args
 from sglang.test.tree_slots import tree_slots_of
-
 
 FULL = ComponentType.FULL
 
@@ -248,3 +250,162 @@ def backup_prefix(cache, dma, node, *, evict=False, persist=False):
         while node.parent is not None and cache.tree_core._is_device_leaf(node):
             assert cache._evict_device_leaf(node.id, tracker) is None
             node = node.parent
+
+
+def transfer(
+    service,
+    *,
+    src="storage",
+    dst="host",
+    caller="A",
+    message="copy",
+    tokens=(1, 2, 3, 4),
+    selection=None,
+):
+    return public_transfer(
+        service,
+        "prefetch",
+        src,
+        dst,
+        message,
+        caller=caller,
+        tokens=selection.token_ids if selection is not None else tokens,
+        salt=selection.cache_salt if selection is not None else None,
+        timeout_ms=None,
+    )
+
+
+def current(service, result):
+    return service.control.registry.get(result.ref)
+
+
+def public_transfer(
+    service,
+    kind,
+    source,
+    destination,
+    message,
+    *,
+    tokens=(1, 2, 3, 4),
+    caller="router",
+    salt=None,
+    timeout_ms=5000,
+):
+    from sglang.srt.managers.kv_control.contracts import HASH_SCHEME
+
+    caps = service.capabilities()["public_protocol"]
+    compatibility = msgspec.json.decode(msgspec.json.encode(caps["prefix"]))
+    compatibility.pop("token_material")
+    compatibility["cache_salt"] = salt
+    assert compatibility["hash_scheme"] == HASH_SCHEME
+    return service.control.submit(
+        KvHintsEnvelope(
+            protocol_version="0.1",
+            message_id=message,
+            actions=[
+                KvHintAction(
+                    action_id="a",
+                    action_type="sglang." + kind,
+                    action_version="1.0",
+                    payload={
+                        "target": {
+                            "kind": "prefix",
+                            "compatibility": compatibility,
+                            "start_token": 0,
+                            "end_token": len(tokens),
+                            "token_ids": list(tokens),
+                        },
+                        "source": {"tier": source},
+                        "destination": {"tier": destination},
+                        "timeout_ms": timeout_ms,
+                    },
+                )
+            ],
+        ),
+        service.control.context(caller),
+    ).results[0]
+
+
+def wait(service, result):
+    wait_for(service, lambda: current(service, result).status.terminal)
+    return current(service, result)
+
+
+def block_io(callback, entered, release):
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return callback(*args, **kwargs)
+
+    return blocked
+
+
+def persist_prefix(cache, service, dma, node):
+    backup_prefix(cache, dma, node, evict=True, persist=True)
+
+    def finished():
+        cache.drain_storage_control_queues()
+        return not cache.ongoing_backup
+
+    wait_for(service, finished)
+
+
+def mooncake_store(cache):
+    from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
+
+    store = MooncakeStore.__new__(MooncakeStore)
+    store.mem_pool_host = cache.host_pool_group.anchor_entry.host_pool
+    store.storage_config = cache.cache_controller.storage_config
+    store.config_prefix = "test"
+    store.unified_suffixes = None
+    store.is_mla_backend = False
+    store.should_split_heads = False
+    store.mha_suffix = "0"
+    store.dcp_size = 1
+    store.enable_storage_metrics = False
+    store._use_group_semantics = False
+    return store
+
+
+def cold_prefix(owner):
+    _, cache, service, dma = owner
+    persist_prefix(cache, service, dma, seed(cache))
+    assert cache.evict_host(4) == 4
+    assert not service.control.executor._walk(
+        (1, 2, 3, 4),
+        service.control.executor._compatibility(
+            TokensTarget(namespace=service.config.namespace, token_ids=(1, 2, 3, 4))
+        ),
+    )
+    return (cache, service, dma)
+
+
+def wait_for(service, condition):
+    deadline = time.monotonic() + 5
+    while not condition():
+        service.progress()
+        assert time.monotonic() < deadline
+        time.sleep(0.005)
+
+
+def prefix_path(cache, service):
+    return service.control.executor._walk(
+        (1, 2, 3, 4),
+        service.control.executor._compatibility(
+            TokensTarget(namespace=service.config.namespace, token_ids=(1, 2, 3, 4))
+        ),
+    )
+
+
+def assert_retired(cache, service):
+    reads = service.control.executor.storage_reads
+    assert not (reads.jobs or reads.interests or reads.demands or reads._joinable)
+    assert not (
+        reads._admission_holds or reads._admission_scopes or reads._admission_tokens
+    )
+    assert not cache.ongoing_prefetch
+    assert not cache.prefetch_loaded_tokens_by_reqid
+    assert not cache.prefetch_loaded_storage_start_by_reqid
+    assert not cache._storage_prefetch_hit_remaining_by_reqid
+    assert cache.cache_controller.prefetch_tokens_occupied == 0
+    assert cache.cache_controller.host_mem_release_queue.empty()

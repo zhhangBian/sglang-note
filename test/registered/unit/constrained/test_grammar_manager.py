@@ -488,7 +488,6 @@ class TestAbortRequests(unittest.TestCase):
 
     def test_abort_by_rid_prefix(self):
         mgr = self._make_mgr_with_queue()
-        mgr.scheduler.kv_control_service = MagicMock()
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
         req.grammar = future
@@ -498,9 +497,6 @@ class TestAbortRequests(unittest.TestCase):
 
         mgr.grammar_queue.abort(abort_req)
         future.cancel.assert_called_once()
-        mgr.scheduler.kv_control_service.finish_request.assert_called_once_with(
-            req, aborted=True
-        )
         req.set_finish_with_abort.assert_called_once()
 
     def test_abort_non_matching_rid(self):

@@ -3,15 +3,15 @@
 
 from __future__ import annotations
 
-import hashlib
+import heapq
 from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Annotated
 
 import msgspec
+from sglang.srt.environ import envs
 from sglang.srt.managers.kv_control.contracts import (
     ClaimState,
-    ControlContext,
     ControlError,
     ExecutionUpdate,
     Location,
@@ -21,7 +21,6 @@ from sglang.srt.managers.kv_control.contracts import (
     Seconds,
     Status,
     TargetOutcome,
-    TaskIdentity,
     Value,
 )
 from sglang.srt.managers.kv_control.protection import (
@@ -53,43 +52,6 @@ class ProtectionLimits(Value):
 class ClaimEvent(Value):
     sequence: int
     claim: ClaimState
-
-
-def protection_key(
-    caller_id: str, claim_id: str, owner_task: TaskIdentity | None
-) -> ProtectionKey:
-    # Content/session selection never establishes demand ownership. Unowned
-    # claims live in a disjoint caller scope and require explicit release/TTL.
-    task = (
-        "task:" + hashlib.sha256(owner_task.session_id.encode()).hexdigest()
-        if owner_task
-        else "caller"
-    )
-    return ProtectionKey(
-        caller_id=caller_id,
-        task_id=task,
-        task_incarnation=owner_task.incarnation if owner_task else 0,
-        claim_id=claim_id,
-    )
-
-
-def effective_claim_id(context: ControlContext, claim_id: str) -> str:
-    """Return a public query/release handle, isolated by request incarnation.
-
-    Attached actions use their original claim ID with the same bound context.
-    Independent follow-ups use the returned ClaimState.claim_id with the same
-    caller and no binding. A sibling sample therefore cannot renew/release the
-    first sample by reusing its envelope's original claim ID.
-    """
-    if context.binding_id is None:
-        return claim_id
-    material = (
-        "sglang.kv.attached.pin.v1",
-        context.caller_id,
-        context.binding_id,
-        claim_id,
-    )
-    return "request:" + hashlib.sha256(msgspec.json.encode(material)).hexdigest()
 
 
 class HostCacheProtection:
@@ -147,10 +109,9 @@ class HostCacheProtection:
                 snapshot = self.registry.get(snapshot.key)
                 remaining = None
         active = snapshot.state == "active"
-        owner = snapshot.owner_task
         return ClaimState(
             caller_id=snapshot.key.caller_id,
-            task_incarnation=str(owner.incarnation) if owner else "caller",
+            task_incarnation="caller",
             claim_id=snapshot.key.claim_id,
             revision=snapshot.revision,
             state=snapshot.state,
@@ -165,7 +126,6 @@ class HostCacheProtection:
             ),
             remaining_ttl=remaining,
             priority=snapshot.priority,
-            owner_task=owner,
             actual_scope=snapshot.actual_scope,
             location=PublicLocation(tier="host", engine_id=self.executor.engine_id),
         )
@@ -177,10 +137,10 @@ class HostCacheProtection:
         self._deadline = self.registry.next_deadline
         return state
 
-    def get(
-        self, *, caller_id: str, claim_id: str, owner_task: TaskIdentity | None
-    ) -> ClaimState:
-        snapshot = self.registry.get(protection_key(caller_id, claim_id, owner_task))
+    def get(self, *, caller_id: str, claim_id: str) -> ClaimState:
+        snapshot = self.registry.get(
+            ProtectionKey(caller_id=caller_id, claim_id=claim_id)
+        )
         if snapshot is None:
             raise ControlError(
                 "missing", "Protection claim is not recorded in this epoch"
@@ -255,11 +215,7 @@ class HostCacheProtection:
     def start(
         self, *, ref: OperationRef, payload: Pin, scope: ResolvedTarget | None
     ) -> tuple[ExecutionUpdate, ClaimState | None]:
-        key = protection_key(
-            ref.context.caller_id,
-            effective_claim_id(ref.context, payload.claim_id),
-            payload.owner_task,
-        )
+        key = ProtectionKey(caller_id=ref.context.caller_id, claim_id=payload.claim_id)
         previous = self.registry.get(key)
         try:
             if payload.mode == "acquire":
@@ -271,7 +227,6 @@ class HostCacheProtection:
                     key=key,
                     revision=payload.revision,
                     prefixes=self._prefixes(scope),
-                    owner_task=payload.owner_task,
                     actual_scope=self.outcomes(
                         scope, status=Status.COMPLETED, step="protection_active"
                     ),
@@ -286,9 +241,7 @@ class HostCacheProtection:
                     priority=payload.priority,
                 )
             else:
-                snapshot = self.registry.release(
-                    key=key, revision=payload.revision, owner_task=payload.owner_task
-                )
+                snapshot = self.registry.release(key=key, revision=payload.revision)
             state = (
                 self._publish(snapshot)
                 if previous != snapshot
@@ -330,3 +283,56 @@ class HostCacheProtection:
                 reason=str(error),
                 target_outcomes=outcomes,
             ), None
+
+
+def evict_by_host_priority(
+    component, num_tokens, tracker, device_frees, host_frees, cache_actions
+):
+    tree = component.tree_core
+    ct = component.component_type
+    priorities = tree.control_state.host_priorities
+    reclaim_duplicates = (
+        tree.is_write_back and not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+    )
+    if reclaim_duplicates:
+        tree._reclaim_full_host_duplicates(
+            num_tokens,
+            tracker,
+            device_frees,
+            host_frees,
+            cache_actions,
+            host_priorities=priorities,
+        )
+
+        def priority_key(node):
+            slot = int(node.component_data[ct].host_value[0])
+            priority = priorities.get(slot)
+            return (priority is not None, priority or 0)
+
+        def leaf_key(node):
+            return priority_key(node), 2, component.session_ref_eviction_strategy(node)
+
+        heap = [(leaf_key(n), n) for n in tree.evictable_host_leaves]
+        if reclaim_duplicates:
+            # At the same priority retain duplicate-first ordering, including
+            # the existing preference to spare imminent GPU demotions.
+            heap.extend(
+                ((priority_key(n), tree._is_device_walk_candidate(n), i), n)
+                for i, n in enumerate(tree.full_host_duplicates.values())
+                if tree._can_reclaim_full_host_duplicate(n)
+            )
+        heapq.heapify(heap)
+        while tracker[ct] < num_tokens and heap:
+            _, x = heapq.heappop(heap)
+            if x not in tree.evictable_host_leaves:
+                if reclaim_duplicates and tree._can_reclaim_full_host_duplicate(x):
+                    tree._release_full_host_duplicate(
+                        x, tracker, device_frees, host_frees, cache_actions
+                    )
+                    tree.full_host_duplicates.pop(x.id, None)
+                continue
+            tree._evict_host_leaf(
+                x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+            if x.parent is not None and x.parent in tree.evictable_host_leaves:
+                heapq.heappush(heap, (leaf_key(x.parent), x.parent))

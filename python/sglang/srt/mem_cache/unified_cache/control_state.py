@@ -29,10 +29,8 @@ class CacheControlConfig:
             "max_query_nodes",
             "max_result_targets",
         ):
-            if (
-                type(getattr(self, name)) is not int
-                or not 1 <= getattr(self, name) <= 1 << 24
-            ):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= 1 << 24:
                 raise ValueError(f"{name} must be a positive bounded integer")
         if (
             type(self.max_concurrent_storage_reads) is not int
@@ -63,13 +61,12 @@ class CacheControlState:
     def bind(self, engine_id: str, engine_epoch: str):
         binding = validated(engine_id, Identifier), validated(engine_epoch, Identifier)
         if self._binding is not None:
-            if self._binding_generation == self.generation:
-                if binding != self._binding:
-                    raise ControlError(
-                        "busy",
-                        "Reset the cache before changing its control owner or epoch",
-                    )
-            elif engine_epoch == self._binding[1]:
+            same_generation = self._binding_generation == self.generation
+            if same_generation and binding != self._binding:
+                raise ControlError(
+                    "busy", "Reset the cache before changing its control owner or epoch"
+                )
+            if not same_generation and engine_epoch == self._binding[1]:
                 raise ControlError(
                     "stale_epoch", "Cache reset requires a fresh control epoch"
                 )
@@ -78,3 +75,28 @@ class CacheControlState:
     def reset(self):
         self.generation += 1
         self.host_priorities.clear()
+
+
+def control_owner(params):
+    from threading import get_ident
+
+    from sglang.srt.mem_cache.allocator.page_interleave import (
+        page_interleave_shard_size,
+    )
+
+    reason = ""
+    owner = get_ident() if params.kv_control_config is not None else None
+    if params.kv_control_config is not None:
+        if params.is_eagle or params.pp_size != 1 or params.attn_cp_size != 1:
+            reason = "Speculative, pipeline and context parallel caches are unsupported"
+        elif (
+            params.mtp_draft_device_pools
+            or params.mtp_draft_mamba_pools
+            or params.enable_mamba_extra_buffer
+            or params.enable_mamba_extra_buffer_lazy
+            or params.decoder_swa_bounded_replay
+            or not params.swa_gates_prefix_match
+            or page_interleave_shard_size(params.token_to_kv_pool_allocator) > 1
+        ):
+            reason = "Auxiliary/draft/sharded cache layouts are unsupported"
+    return owner, reason

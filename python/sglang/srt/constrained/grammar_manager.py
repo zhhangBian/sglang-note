@@ -126,9 +126,6 @@ class GrammarManager:
                 logger.debug(f"Abort grammar queue request. {req.rid=}")
                 if isinstance(req.grammar, futures.Future) and req.grammar:
                     req.grammar.cancel()
-                service = getattr(self.scheduler, "kv_control_service", None)
-                if service is not None:
-                    service.finish_request(req, aborted=True)
                 req.set_finish_with_abort("Aborted by AbortReq.")
 
     def _get_request_thinking_budget(self, req: Req) -> int | None:

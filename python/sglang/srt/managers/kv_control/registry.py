@@ -29,7 +29,6 @@ from sglang.srt.managers.kv_control.contracts import (
     Status,
     Submission,
     Value,
-    is_native_action,
     validated,
 )
 from sglang.srt.managers.kv_control.public import project_result
@@ -60,7 +59,7 @@ class NativeBatch(Value):
 
 
 def snapshot_envelope(
-    envelope: KvHintsEnvelope, limits: Limits, *, request_attached: bool
+    envelope: KvHintsEnvelope, limits: Limits
 ) -> tuple[NativeBatch, tuple[KvHintAction, ...]]:
     """Snapshot native JSON without inspecting independent consumers' payloads.
 
@@ -74,14 +73,8 @@ def snapshot_envelope(
     for action in envelope.actions:
         if not isinstance(action, KvHintAction) or type(action.action_type) is not str:
             raise ControlError("invalid_envelope", "Malformed action wrapper")
-        # On inference requests other consumers can own future names or versions.
-        # Standalone control returns an operation receipt for every sglang.* action.
-        claimed = (
-            is_native_action(action)
-            if request_attached
-            else action.action_type.startswith("sglang.")
-        )
-        (native if claimed else unhandled).append(action)
+        owner = native if action.action_type.startswith("sglang.") else unhandled
+        owner.append(action)
     if len(native) > limits.max_actions:
         raise ControlError("capacity", "Native action count exceeds limit")
     if not native:
@@ -232,19 +225,15 @@ class OperationRegistry:
 
     def set_public_claim(self, ref, claim):
         """Attach the synchronous PIN receipt at the operation's current version."""
-        current = self.get(ref)
+        _, message, current = self._operation(ref)
         if current.public_result is None:
             raise ControlError(
                 "invalid_completion", "Claim receipt requires a public action"
             )
-        self._messages[self._key(ref.context, ref.message_id)].results[
-            ref.action_id
-        ] = msgspec.structs.replace(
-            current,
-            public_result=msgspec.structs.replace(current.public_result, claim=claim),
+        public = msgspec.structs.replace(current.public_result, claim=claim)
+        message.results[ref.action_id] = self._stamp(
+            msgspec.structs.replace(current, public_result=public)
         )
-        message = self._messages[self._key(ref.context, ref.message_id)]
-        message.results[ref.action_id] = self._stamp(message.results[ref.action_id])
 
     def reserve(self, batch: NativeBatch, context: ControlContext) -> Submission:
         key = self._key(context, batch.message_id)
@@ -314,39 +303,35 @@ class OperationRegistry:
             raise ControlError("missing", "Unknown or expired native message")
         return self._submission(message, replayed=False)
 
-    def get(self, ref: OperationRef) -> OperationResult:
+    def _operation(self, ref):
         ref = validated(ref, OperationRef)
-        message = self.query(ref.context, ref.message_id)
-        for result in message.results:
-            if result.ref.action_id == ref.action_id:
-                if result.ref != ref:
-                    raise ControlError(
-                        "stale_operation", "Operation incarnation differs"
-                    )
-                return result
-        raise ControlError("missing", "Unknown, acknowledged or expired operation")
+        key = self._key(ref.context, ref.message_id)
+        self.prune()
+        message = self._messages.get(key)
+        if message is None:
+            raise ControlError("missing", "Unknown or expired native message")
+        result = message.results.get(ref.action_id)
+        if result is None:
+            raise ControlError("missing", "Unknown, acknowledged or expired operation")
+        if result.ref != ref:
+            raise ControlError("stale_operation", "Operation incarnation differs")
+        return key, message, result
+
+    def get(self, ref: OperationRef) -> OperationResult:
+        return self._operation(ref)[2]
 
     def lookup(self, context: ControlContext, message_id: str, *, limit: int = 256):
-        """Discover bounded fan-out incarnations without guessing binding IDs."""
-        self._key(context, message_id)
+        key = self._key(context, message_id)
         if type(limit) is not int or not 1 <= limit <= self.limits.max_page_size:
             raise ControlError("capacity", "Lookup limit exceeds page budget")
         self.prune()
-        matches = [
-            self._submission(message, replayed=False)
-            for (caller, binding, identity), message in self._messages.items()
-            if caller == context.caller_id
-            and identity == message_id
-            and (context.binding_id is None or binding == context.binding_id)
-        ]
-        if len(matches) > limit:
-            raise ControlError(
-                "capacity", "Too many incarnations; query an explicit binding"
-            )
-        return tuple(matches)
+        message = self._messages.get(key)
+        return (
+            (self._submission(message, replayed=False),) if message is not None else ()
+        )
 
     def update(self, ref: OperationRef, update: ExecutionUpdate) -> OperationResult:
-        current = self.get(ref)
+        key, message, current = self._operation(ref)
         update = validated(update, ExecutionUpdate)
         self._validate_update(update)
         if update == current.update:
@@ -397,8 +382,6 @@ class OperationRegistry:
             if current.action_type in PUBLIC_ACTIONS
             else current.public_result,
         )
-        key = self._key(ref.context, ref.message_id)
-        message = self._messages[key]
         result = self._stamp(result)
         message.results[ref.action_id] = result
         if result.status.terminal:
@@ -409,7 +392,7 @@ class OperationRegistry:
         return result
 
     def set_public_scope(self, ref, requested, cache_generation):
-        current = self.get(ref)
+        _, message, current = self._operation(ref)
         public = PublicResult(
             requested_scope=requested,
             owner_epoch=ref.context.engine_epoch,
@@ -417,9 +400,9 @@ class OperationRegistry:
             outcome_sequence=current.sequence,
             cache_generation=cache_generation,
         )
-        self._messages[self._key(ref.context, ref.message_id)].results[
-            ref.action_id
-        ] = msgspec.structs.replace(current, public_result=public)
+        message.results[ref.action_id] = msgspec.structs.replace(
+            current, public_result=public
+        )
 
     def _validate_update(self, update):
         if len(update.reason) > 4096 or len(update.code) > 256:

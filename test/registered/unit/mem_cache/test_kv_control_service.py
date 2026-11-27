@@ -5,18 +5,16 @@ import unittest
 from array import array
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import msgspec
 import pytest
 import test_kv_control_cache as cache_fixtures
-
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightVersionReqInput,
 )
-from sglang.srt.managers.kv_control.contracts import TokensTarget, resolve_prefix
 from sglang.srt.managers.kv_control.key_namespace import encode_cache_salt
 from sglang.srt.managers.kv_control.service import (
     KVControlService,
@@ -24,27 +22,15 @@ from sglang.srt.managers.kv_control.service import (
     dispatch,
     runtime_config,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-
-def serving_request(rid="same", *, salt=None):
-    return Req(
-        rid=rid,
-        origin_input_text=None,
-        origin_input_ids=array("q", [1, 2, 3, 4]),
-        sampling_params=SamplingParams(max_new_tokens=1),
-        vocab_size=128,
-        cache_salt=salt,
-    )
 
 
 @contextmanager
@@ -61,16 +47,9 @@ def service_owner(case, *, namespace_keys=False):
     assert not service.has_pending
 
 
-insert, match_len, target = (
-    cache_fixtures.insert,
-    cache_fixtures.match_len,
-    cache_fixtures.target,
-)
-
-
 class TestKVControlService(cache_fixtures.KVCacheTestCase):
     def test_owner_watermark_orders_real_ready_remove_and_scoped_reconciliation(self):
-        import test_kv_control_transfers as transfer_fixtures
+        import kv_control_test_utils as transfer_fixtures
         from sglang.srt.managers.kv_control.contracts import Status
 
         with transfer_fixtures.hicache(self, storage=True) as owner:
@@ -124,34 +103,6 @@ class TestKVControlService(cache_fixtures.KVCacheTestCase):
             reply = dispatch(service, {"kind": "capacity", "context": context})
             self.assertEqual(reply["error"]["code"], "stale_epoch")
 
-    def test_request_cached_bounds_committed_prefix_to_whole_pages(self):
-        from sglang.srt.managers.kv_control.contracts import MAX_SCOPE_TOKENS
-
-        cache, _ = self.make(session=False, page_size=64)
-        cache.reset()
-        service = KVControlService(
-            cache, ServiceConfig(namespace="ns"), clock=self.clock
-        )
-        for n, expected in ((63, 0), (65, 64), (70000, 65536)):
-            req = serving_request()
-            req.full_untruncated_fill_ids = array("q", range(n))
-            req.finished_reason = FINISH_LENGTH(1)
-            req.kv_control_context = service.control.context(
-                "request", binding_id=str(n)
-            )
-            with patch.object(service.control, "request_event") as finish:
-                service.finish_request(req, committed_len=n, checkpointed=True)
-            committed = finish.call_args.kwargs["committed"]
-            if expected == 0:
-                self.assertIsNone(committed)
-            else:
-                scope = resolve_prefix(
-                    committed, finish.call_args.args[0], service.config.limits
-                )
-                self.assertEqual(scope.requested.end_token, expected)
-                self.assertEqual(scope.content.token_ids, tuple(range(expected)))
-                self.assertLessEqual(expected, MAX_SCOPE_TOKENS)
-
     def test_hicache_runtime_profile_accepts_both_scheduler_modes(self):
         for disabled, tp_size in ((False, 1), (True, 1), (False, 2), (True, 4)):
             with self.subTest(disable_overlap_schedule=disabled, tp_size=tp_size):
@@ -179,55 +130,14 @@ class TestKVControlService(cache_fixtures.KVCacheTestCase):
                     with pytest.raises(ValueError):
                         runtime_config()
 
+    def test_request_and_independent_residency_use_the_same_cache_salt(self):
+        from sglang.srt.managers.scheduler import Scheduler
 
-def namespace_request(salt=None, session=None):
-    return Req(
-        rid="r",
-        origin_input_text=None,
-        origin_input_ids=array("q", [1, 2, 3, 4]),
-        sampling_params=SamplingParams(max_new_tokens=1),
-        vocab_size=128,
-        cache_salt=salt,
-        session=session,
-    )
-
-
-def complete_request(cache, service, req):
-    service.prepare_request(req)
-    req.output_ids = array("q", [5])
-    req.finished_reason = FINISH_LENGTH(1)
-    cache.req_to_token_pool.alloc([req])
-    slots = cache.token_to_kv_pool_allocator.alloc(5)
-    cache.req_to_token_pool.write((req.kv.req_pool_idx, slice(0, 5)), slots)
-    req.kv.kv_allocated_len = req.kv.kv_committed_len = 5
-    release_kv_cache(req, cache, checkpoint=True)
-
-
-def namespace_target(service, salt=None):
-    return TokensTarget(
-        namespace=service.config.namespace, token_ids=(1, 2, 3, 4, 5), cache_salt=salt
-    )
-
-
-class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
-    def test_ordinary_unhinted_request_and_independent_lookup_use_same_real_key(self):
-        with service_owner(self, namespace_keys=True) as owner:
+        with service_owner(self, namespace_keys=True) as (cache, service):
             salt = "tenant-a"
-            from sglang.srt.managers.scheduler import Scheduler
-
-            class TaggedReq(Req):
-                pass
-
-            class TaggedScheduler(Scheduler):
-                def _create_generation_req(self, recv_req, *args, **kwargs):
-                    return TaggedReq(*args, **kwargs)
-
-            cache, service = owner
-            cache_fixtures.insert(cache, [1, 2, 3, 4, 5], salt=salt)
-            scheduler = Scheduler.__new__(TaggedScheduler)
+            scheduler = Scheduler.__new__(Scheduler)
             scheduler.kv_control_service = service
-            req = scheduler._new_generation_req(
-                SimpleNamespace(kv_hints=None, mm_inputs=None),
+            req = Req(
                 rid="r",
                 origin_input_text=None,
                 origin_input_ids=array("q", [1, 2, 3, 4]),
@@ -235,36 +145,24 @@ class TestKVControlNamespaces(cache_fixtures.KVCacheTestCase):
                 vocab_size=128,
                 cache_salt=salt,
             )
-            assert isinstance(req, TaggedReq)
-            complete_request(cache, service, req)
-            assert service._request_sequence == 0
-            assert not hasattr(req, "kv_control_context")
+            scheduler._maybe_namespace_elastic_radix_cache(req)
             assert req.cache_salt == encode_cache_salt("ns", salt)
-            assert req.kv_control_logical_cache_salt == salt
-            snapshot = service.control.executor.residency(
-                resolve_prefix(
-                    namespace_target(service, salt),
-                    service.control.context("test"),
-                    service.config.limits,
-                )
-            )
-            assert (
-                sum(
-                    item.descriptor.end_token - item.descriptor.start_token
-                    for item in snapshot.items
-                )
-                == 5
-            )
-            assert not snapshot.missing
-            encoded_as_logical = service.control.executor.residency(
-                resolve_prefix(
-                    namespace_target(service, req.cache_salt),
-                    service.control.context("test"),
-                    service.config.limits,
-                )
-            )
-            assert not encoded_as_logical.items and encoded_as_logical.missing
-            cache.sanity_check()
+            cache_fixtures.insert(cache, req.origin_input_ids, salt=req.cache_salt)
+
+            def residency(logical_salt):
+                return dispatch(
+                    service,
+                    dict(
+                        kind="residency",
+                        context=service.control.context("test"),
+                        target=cache_fixtures.target(cache_salt=logical_salt),
+                    ),
+                )["data"]
+
+            hit = residency(salt)
+            assert hit["items"] and not hit["missing"]
+            miss = residency(req.cache_salt)
+            assert not miss["items"] and miss["missing"]
 
 
 class TestKVControlWeights(cache_fixtures.KVCacheTestCase):

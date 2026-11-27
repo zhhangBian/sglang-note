@@ -10,22 +10,17 @@ import torch
 from kv_control_test_utils import (
     FULL,
     backup_prefix,
+    block_io,
+    current,
     hicache,
+    mooncake_store,
+    public_transfer,
     seed,
-    start_inference_backup,
     start_inference_load,
+    wait,
 )
 from sglang.srt.managers.kv_control.contracts import Status
 from sglang.test.ci.ci_register import register_cpu_ci
-from test_kv_control_transfers import (
-    block_io,
-    current,
-    mooncake_store,
-    persist_prefix,
-    public_transfer,
-    wait,
-    wait_for,
-)
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -136,99 +131,6 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertIsNotNone(sibling.component_data[FULL].host_value)
             self.assertIsNone(leaf.component_data[FULL].host_value)
             cache.sanity_check()
-
-    def test_gpu_resident_host_copy_is_not_queued_for_storage(self):
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            backup_prefix(cache, dma, node)
-            pool = cache.host_pool_group.anchor_entry.host_pool
-            initial = pool.available_size()
-            with patch.object(cache.cache_controller, "write_storage") as write:
-                done = public_transfer(service, "demote", "host", "storage", "cold")
-                write.assert_not_called()
-            self.assertEqual(done.status, Status.DEFERRED)
-            self.assertTrue(done.update.quiescent)
-            self.assertFalse(done.public_result.preserved_scope)
-            self.assertFalse(done.public_result.reclaimed_scope)
-            self.assertEqual(
-                {o.code for o in done.public_result.blocked_scope},
-                {"source_gpu_resident"},
-            )
-            self.assertEqual(pool.available_size(), initial)
-            self.assertIsNotNone(node.component_data[FULL].value)
-            self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
-
-    def test_unpublished_backup_does_not_enqueue_a_storage_write(self):
-        with hicache(self, storage=True, write_policy="write_through") as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            start_inference_backup(cache, node)
-            self.assertTrue(dma.pending)
-            with patch.object(cache.cache_controller, "write_storage") as write:
-                blocked = public_transfer(service, "demote", "host", "storage", "cold")
-                self.assertEqual(blocked.status, Status.DEFERRED)
-                self.assertEqual(blocked.update.code, "inflight_backup")
-                write.assert_not_called()
-            dma.finish()
-            cache.writing_check()
-            cache.sanity_check()
-
-    def test_pin_and_computation_refs_skip_storage_and_allow_retry_after_release(self):
-        from test_kv_control_protection import run_pin
-
-        for protection in ("pin", "compute"):
-            with (
-                self.subTest(protection=protection),
-                hicache(self, storage=True, write_policy="write_through") as owner,
-            ):
-                _, cache, service, dma = owner
-                node = seed(cache)
-                persist_prefix(cache, service, dma, node)
-                pool = cache.host_pool_group.anchor_entry.host_pool
-                initial = pool.available_size()
-                if protection == "pin":
-                    self.assertEqual(run_pin(service)["update"]["status"], "completed")
-                    lock = None
-                else:
-                    lock = cache.lock(node.id)
-                try:
-                    with patch.object(cache.cache_controller, "write_storage") as write:
-                        done = public_transfer(
-                            service, "demote", "host", "storage", "cold"
-                        )
-                        write.assert_not_called()
-                    self.assertEqual(done.status, Status.DEFERRED)
-                    self.assertEqual(
-                        {o.code for o in done.public_result.blocked_scope},
-                        {"active_reference"},
-                    )
-                    self.assertFalse(done.public_result.preserved_scope)
-                    self.assertFalse(done.public_result.reclaimed_scope)
-                    self.assertEqual(pool.available_size(), initial)
-                    self.assertGreater(
-                        node.component_data[FULL].host_lock_ref
-                        if protection == "pin"
-                        else node.component_data[FULL].lock_ref,
-                        0,
-                    )
-                finally:
-                    if lock is not None:
-                        cache.unlock(lock)
-                    else:
-                        run_pin(service, mode="release", revision=2, message="release")
-                # Existing bytes must be confirmed without rewriting them.
-                with patch(
-                    "sglang.srt.mem_cache.hicache_storage.os.replace",
-                    side_effect=AssertionError("redundant storage write"),
-                ):
-                    retried = public_transfer(
-                        service, "demote", "host", "storage", "retry"
-                    )
-                    self.assertEqual(wait(service, retried).status, Status.COMPLETED)
-                self.assertEqual(pool.available_size(), initial + 4)
-                cache.sanity_check()
 
     def test_radix_split_during_write_retains_ack_geometry_and_reclaims_each_slot_once(
         self,
@@ -403,51 +305,6 @@ class TestKVControlHostDemote(cache_fixtures.KVCacheTestCase):
             self.assertIsNotNone(node.component_data[FULL].host_value)
             self.assertEqual(pool.available_size(), initial)
             self.assertEqual(node.component_data[FULL].host_lock_ref, 0)
-            cache.sanity_check()
-
-    def test_missing_prior_backup_is_rewritten_before_host_reclamation(self):
-        from pathlib import Path
-
-        with hicache(self, storage=True) as owner:
-            _, cache, service, dma = owner
-            node = seed(cache)
-            backup_prefix(cache, dma, node, evict=True)
-            cache.write_backup_storage(node.id)
-
-            def saved():
-                cache.drain_storage_control_queues()
-                return not cache.ongoing_backup
-
-            wait_for(service, saved)
-            cc = cache.cache_controller
-            hashes = cache.tree_core.get_hash_values(node.id)
-            files = [
-                Path(cc.storage_backend.file_path, key + ".bin")
-                for h in hashes
-                for key in cc.storage_backend._get_component_keys(h)
-            ]
-            for path in files:
-                path.unlink()
-            # A previous native receipt or node backup flag cannot substitute
-            # for the current verified worker result.
-            done = wait(
-                service, public_transfer(service, "demote", "host", "storage", "cold")
-            )
-            self.assertEqual(done.status, Status.COMPLETED)
-            self.assertTrue(all(path.is_file() for path in files))
-            self.assertFalse(cache.tree_core.root_node.children)
-            cache.sanity_check()
-
-    def test_inside_node_endpoint_is_rejected_without_reclaiming_extra_tokens(self):
-        with hicache(self, storage=True) as owner:
-            cache, service, _, node, pool, initial = backed_up_host(owner)
-            result = public_transfer(
-                service, "demote", "host", "storage", "short", tokens=(1, 2)
-            )
-            self.assertEqual(result.status, Status.UNSUPPORTED)
-            self.assertFalse(result.public_result.reclaimed_scope)
-            self.assertEqual(pool.available_size(), initial)
-            self.assertEqual(len(node.component_data[FULL].host_value), 4)
             cache.sanity_check()
 
     def test_cancel_waits_for_storage_quiescence_and_never_reclaims_source(self):

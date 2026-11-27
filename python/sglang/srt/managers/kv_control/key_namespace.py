@@ -4,7 +4,6 @@
 import hashlib
 
 import msgspec
-
 from sglang.srt.managers.kv_control.contracts import ControlError
 
 SALT_ENCODING = 'sha256 of compact UTF-8 JSON ["sglang.kv.weight.v1", namespace, original_salt_or_null]'
