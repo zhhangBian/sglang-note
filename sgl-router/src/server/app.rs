@@ -216,6 +216,18 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
 /// in place of the one resolved from the environment.
 pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize) -> Router {
     let router = Router::new()
+        .route(
+            "/v1/kv/capabilities",
+            get(crate::server::routes::kv_control::capabilities),
+        )
+        .route(
+            "/v1/kv/control",
+            post(crate::server::routes::kv_control::control).layer(DefaultBodyLimit::max(1 << 20)),
+        )
+        .route(
+            "/v1/kv/session/events",
+            post(crate::server::routes::kv_control::events).layer(DefaultBodyLimit::max(1 << 20)),
+        )
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
         // Aliases of the probes above: the engine's `/health`, and the

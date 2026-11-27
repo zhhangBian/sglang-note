@@ -4,6 +4,7 @@
 pub mod cache;
 pub mod chat;
 pub mod health;
+pub mod kv_control;
 pub mod messages;
 pub mod metrics;
 pub mod models;
