@@ -4639,8 +4639,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 + ", ".join(dead)
             )
 
-    def check_hicache_events(self) -> None:
-        """Called per scheduler step to poll async HiCache events."""
+    def check_hicache_events(self) -> Optional[bool]:
+        """Poll async HiCache events and report completed device backups."""
         if self.linker is not None:
             finish_counts = torch.tensor(
                 [self.linker.num_completed_offloads()],
@@ -4701,6 +4701,8 @@ class UnifiedRadixCache(BasePrefixCache):
             if not hasattr(storage_metrics, "prefetch_stats"):
                 storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+        # This count is already synchronized; all ranks retry admission together.
+        return write_finish_count > 0
 
     def transfers_in_flight(self) -> bool:
         # The buffer-mode pipeline (storage without a host pool) tracks its
