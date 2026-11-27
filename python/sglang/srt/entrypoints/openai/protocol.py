@@ -80,6 +80,7 @@ try:
 except:
     StructuralTag = Any
 
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +457,7 @@ class CompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    kv_hints: Optional[KvHintsEnvelope] = None
     # Priority for the request
     priority: Optional[int] = None
 
@@ -1137,6 +1139,7 @@ class ChatCompletionRequest(PDRoutingFields):
     extra_key: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
+    kv_hints: Optional[KvHintsEnvelope] = None
     # Priority for the request
     priority: Optional[int] = None
 

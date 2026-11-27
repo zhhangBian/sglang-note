@@ -1574,6 +1574,18 @@ class Engine(EngineScoreMixin, EngineBase):
     def flush_cache(self):
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
+    def kv_capabilities(self):
+        return self.kv_control({"kind": "capabilities"})
+
+    async def async_kv_capabilities(self):
+        return await self.async_kv_control({"kind": "capabilities"})
+
+    def kv_control(self, command):
+        return self.loop.run_until_complete(self.async_kv_control(command))
+
+    async def async_kv_control(self, command):
+        return await self.tokenizer_manager.kv_control(command)
+
     def open_session(
         self,
         capacity_of_str_len: int,
@@ -1732,6 +1744,9 @@ class Engine(EngineScoreMixin, EngineBase):
         group_name: str = "weight_update_group",
         flush_cache: bool = True,
         load_format: Optional[str] = None,
+        *,
+        weight_version: Optional[str] = None,
+        selector: str = "all",
     ):
         """Update weights from distributed source."""
         obj = UpdateWeightsFromDistributedReqInput(
@@ -1742,6 +1757,8 @@ class Engine(EngineScoreMixin, EngineBase):
             group_name=group_name,
             flush_cache=flush_cache,
             load_format=load_format,
+            weight_version=weight_version,
+            selector=selector,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
@@ -1755,6 +1772,9 @@ class Engine(EngineScoreMixin, EngineBase):
         ],
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        *,
+        weight_version: Optional[str] = None,
+        selector: str = "all",
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
@@ -1765,6 +1785,8 @@ class Engine(EngineScoreMixin, EngineBase):
             serialized_named_tensors=serialized_named_tensors,
             load_format=load_format,
             flush_cache=flush_cache,
+            weight_version=weight_version,
+            selector=selector,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
@@ -1774,6 +1796,9 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         model_path: str,
         load_format: Optional[str] = None,
+        *,
+        weight_version: Optional[str] = None,
+        flush_cache: bool = True,
     ):
         """Update the weights from disk inplace without re-launching the engine.
 
@@ -1783,6 +1808,8 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         obj = UpdateWeightFromDiskReqInput(
             model_path=model_path,
+            weight_version=weight_version,
+            flush_cache=flush_cache,
             load_format=load_format,
         )
 
@@ -1794,10 +1821,13 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         zmq_handles: Dict[str, str],
         flush_cache: bool = True,
+        *,
+        weight_version: Optional[str] = None,
     ):
         """Update weights from IPC for checkpoint-engine integration."""
         obj = UpdateWeightsFromIPCReqInput(
             zmq_handles=zmq_handles,
+            weight_version=weight_version,
             flush_cache=flush_cache,
         )
         return self.loop.run_until_complete(

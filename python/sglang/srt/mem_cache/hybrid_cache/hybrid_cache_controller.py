@@ -22,6 +22,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
     PrefetchAck,
+    PrefetchCancellation,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -198,7 +199,7 @@ class StorageOperation(BaseStorageOperation):
         self.pool_storage_result = PoolTransferResult.empty()
 
 
-class PrefetchOperation(StorageOperation):
+class PrefetchOperation(PrefetchCancellation, StorageOperation):
     def __init__(
         self,
         handle: CacheRequestHandle,
@@ -213,8 +214,6 @@ class PrefetchOperation(StorageOperation):
         self.storage_read_metadata = storage_read_metadata
         self.handle = handle
         self.request_id = handle.rid
-        self._lock = threading.Lock()
-        self._terminated_flag = False
         self.storage_hit_count = 0
         # KV pages the hit-time plan skips in front of the KV transfer: the
         # device trim, then the span head a component's block groups serve.
@@ -246,14 +245,6 @@ class PrefetchOperation(StorageOperation):
         self.sidecar_hit_pages = 0
         # Cut by the stop policy, not a storage shortfall: the span is still stored.
         self.deadline_expired = False
-
-    def mark_terminate(self):
-        with self._lock:
-            self._terminated_flag = True
-
-    def is_terminated(self) -> bool:
-        with self._lock:
-            return self._terminated_flag
 
 
 @dataclass(frozen=True)
@@ -1674,6 +1665,8 @@ class HybridCacheController(BaseHiCacheController):
         hash_value: Optional[List[str]] = None,
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        verify_prefix: bool = False,
     ) -> int:
         operation = StorageOperation(
             host_indices,
@@ -1682,6 +1675,7 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        operation.verify_backup_prefix = verify_prefix
         self.backup_queue.put(operation)
         return operation.id
 

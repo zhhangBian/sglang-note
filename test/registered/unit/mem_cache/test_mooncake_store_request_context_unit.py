@@ -417,6 +417,19 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         self.assertEqual(set_binding.event_log[0][1]["caller_id"], "sglang-tp0")
         self.assertEqual(set_binding.event_log[0][1]["caller_role"], "backup")
 
+    def test_legacy_verification_checks_each_object_without_size_metadata(self):
+        store = _make_mooncake_store(_LegacyBinding())
+        store._batch_preprocess = lambda keys, indices: (
+            ["k0", "k1"],
+            [],
+            [[4, 8], [4, 8]],
+        )
+        for value, pages in ((bytes(12), 2), (bytes(11), 1), (bytes(13), 1), (None, 1)):
+            store.store.get = {"k0": bytes(12), "k1": value}.get
+            self.assertEqual(
+                store.verify_backup_prefix(["a", "b"], [0, 1], None), pages
+            )
+
     def test_batch_exists_v2_wraps_sidecar_exist(self):
         binding = _SupportedBinding(exist=1)
         store = _make_mooncake_store(binding)
