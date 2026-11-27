@@ -109,7 +109,7 @@ impl ResolvedScope {
         &self.scope
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FrozenTarget {
     snapshot_revision: Option<u64>,
     known_scope: Vec<ResolvedScope>,
@@ -137,26 +137,17 @@ impl FrozenTarget {
 
 impl SessionIndex {
     pub fn resolve(&self, selector: Selector) -> FrozenTarget {
-        let mut result = FrozenTarget {
-            snapshot_revision: None,
-            known_scope: Vec::new(),
-            missing_scope: Vec::new(),
-            materialization_required: Vec::new(),
-        };
+        let mut result = FrozenTarget::default();
         match selector {
-            Selector::Session(id) => match self.branch_ids(&id) {
+            Selector::Session(id) => match self.branches(&id) {
                 None => result.missing_scope.push(MissingScope::Session(id)),
-                Some(ids) => {
+                Some(branches) => {
                     result.snapshot_revision = self.session_revision(&id);
-                    if ids.is_empty() {
-                        result.missing_scope.push(MissingScope::EmptySession(id));
+                    for branch in branches {
+                        result.push_snapshot(branch);
                     }
-                    for branch in ids {
-                        if let Some(snapshot) =
-                            self.branch(&branch.session, &branch.branch_id, Some(branch.revision))
-                        {
-                            result.push_snapshot(snapshot);
-                        }
+                    if result.known_scope.is_empty() {
+                        result.missing_scope.push(MissingScope::EmptySession(id));
                     }
                 }
             },
@@ -287,7 +278,6 @@ impl SessionIndex {
             start_token: scope.start_token,
             end_token: scope.end_token,
             token_ids: Some(tokens),
-            blocks: Vec::new(),
         })
     }
 }

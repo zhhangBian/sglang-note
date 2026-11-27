@@ -121,26 +121,6 @@ impl ContentNode {
     pub fn end_token(&self) -> u64 {
         self.end_token
     }
-    pub fn contains_ancestor(&self, key: &ContentKey, end: u64) -> bool {
-        let mut node = Some(self);
-        while let Some(n) = node {
-            if &n.key == key && n.end_token == end {
-                return true;
-            }
-            node = n.parent.as_deref();
-        }
-        false
-    }
-    fn ancestor_at(&self, end: u64) -> Option<&Self> {
-        let mut node = Some(self);
-        while let Some(n) = node {
-            if n.end_token == end {
-                return Some(n);
-            }
-            node = n.parent.as_deref();
-        }
-        None
-    }
 }
 
 /// Tokens cover only [parent.end, end), not a second copy of the entire prefix.
@@ -157,11 +137,6 @@ pub struct SnapshotId {
     pub session: SessionIdentity,
     pub branch_id: String,
     pub revision: u64,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParentFrontier {
-    pub snapshot: SnapshotId,
-    pub end_token: u64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RequestIdentity {
@@ -180,7 +155,6 @@ pub enum AssociationProvenance {
 pub struct BranchRevision {
     id: SnapshotId,
     session_revision: u64,
-    parent_frontier: Option<ParentFrontier>,
     original_end: u64,
     provenance: AssociationProvenance,
     content: Arc<ContentNode>,
@@ -191,9 +165,6 @@ impl BranchRevision {
     }
     pub fn session_revision(&self) -> u64 {
         self.session_revision
-    }
-    pub fn parent_frontier(&self) -> Option<&ParentFrontier> {
-        self.parent_frontier.as_ref()
     }
     pub fn original_end(&self) -> u64 {
         self.original_end
@@ -212,7 +183,6 @@ pub struct Association {
     pub branch_id: String,
     pub branch_revision: u64,
     pub content: ContentKey,
-    pub parent_frontier: Option<ParentFrontier>,
     pub request: Option<RequestIdentity>,
     pub original_end: Option<u64>,
     pub provenance: AssociationProvenance,
@@ -429,15 +399,15 @@ impl SessionIndex {
             suffix_tokens,
         } = registration;
         self.check_content(&key)?;
-        let parent_node = match parent.as_ref() {
-            Some(p) => Some(
+        let parent_node = parent
+            .as_ref()
+            .map(|p| {
                 self.contents
                     .get(p)
-                    .ok_or(IndexError::UnknownContent)?
-                    .clone(),
-            ),
-            None => None,
-        };
+                    .cloned()
+                    .ok_or(IndexError::UnknownContent)
+            })
+            .transpose()?;
         let start = parent_node.as_ref().map_or(0, |n| n.end_token);
         if end_token > MAX_INTEGER
             || end_token <= start
@@ -562,10 +532,11 @@ impl SessionIndex {
         task.revision = revision;
         Ok(())
     }
-    pub(crate) fn branch_ids(&self, id: &SessionIdentity) -> Option<Vec<SnapshotId>> {
-        self.sessions
-            .get(id)
-            .map(|s| s.branches.values().map(|b| b.id.clone()).collect())
+    pub(crate) fn branches(
+        &self,
+        id: &SessionIdentity,
+    ) -> Option<impl Iterator<Item = Arc<BranchRevision>> + '_> {
+        Some(self.sessions.get(id)?.branches.values().cloned())
     }
     pub fn branch(
         &self,
@@ -621,7 +592,6 @@ impl SessionIndex {
             if old.session_revision == a.session_revision
                 && old.content.key == a.content
                 && old.original_end == a.original_end.unwrap_or(old.content.end_token)
-                && old.parent_frontier == a.parent_frontier
                 && old.provenance == a.provenance
                 && a.request
                     .as_ref()
@@ -649,21 +619,6 @@ impl SessionIndex {
             .get(&a.content)
             .ok_or(IndexError::UnknownContent)?
             .clone();
-        if let Some(frontier) = &a.parent_frontier {
-            let p = self
-                .history
-                .get(&frontier.snapshot)
-                .ok_or(IndexError::UnknownParent)?;
-            if frontier.snapshot.session.caller_id != a.session.caller_id
-                || p.content
-                    .ancestor_at(frontier.end_token)
-                    .is_none_or(|ancestor| {
-                        !content.contains_ancestor(ancestor.key(), frontier.end_token)
-                    })
-            {
-                return Err(IndexError::InvalidPrefix);
-            }
-        }
         let is_new_branch = !s.branches.contains_key(&a.branch_id);
         let replaced = s.branches.get(&a.branch_id).map(|b| b.id.clone());
         let original_end = a.original_end.unwrap_or(content.end_token);
@@ -695,7 +650,6 @@ impl SessionIndex {
         let snapshot = Arc::new(BranchRevision {
             id: id.clone(),
             session_revision: a.session_revision,
-            parent_frontier: a.parent_frontier,
             original_end,
             provenance: a.provenance,
             content,
@@ -740,32 +694,27 @@ impl SessionIndex {
         id: String,
     ) -> Result<OwnedResourceId, IndexError> {
         self.check_id(&id)?;
-        let s = self.sessions.get(task).ok_or(IndexError::UnknownSession)?;
-        let (set, count, max, name) = match kind {
+        let session = self
+            .sessions
+            .get_mut(task)
+            .ok_or(IndexError::UnknownSession)?;
+        let (set, total, max, name) = match kind {
             ResourceKind::Claim => (
-                &s.claims,
-                self.usage().claims,
+                &mut session.claims,
+                &mut self.counts.claims,
                 self.limits.max_claims,
                 "claims",
             ),
             ResourceKind::Intent => (
-                &s.intents,
-                self.usage().intents,
+                &mut session.intents,
+                &mut self.counts.intents,
                 self.limits.max_intents,
                 "intents",
             ),
         };
-        if !set.contains(&id) && count >= max {
+        if !set.contains(&id) && *total >= max {
             return Err(IndexError::Capacity(name));
         }
-        let s = self
-            .sessions
-            .get_mut(task)
-            .expect("validated active session");
-        let (set, total) = match kind {
-            ResourceKind::Claim => (&mut s.claims, &mut self.counts.claims),
-            ResourceKind::Intent => (&mut s.intents, &mut self.counts.intents),
-        };
         *total += usize::from(set.insert(id.clone()));
         Ok(OwnedResourceId {
             task: task.clone(),

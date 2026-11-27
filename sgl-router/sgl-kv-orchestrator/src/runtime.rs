@@ -5,7 +5,10 @@ use super::{
 use crate::{
     models::{PrefixTarget, SessionIdentity},
     operations::{DemandBook, DemandId},
-    protocol::{parse_action, Action, MAX_SCOPE_TOKENS},
+    protocol::{
+        parse_engine_action, validate_prefix, ACTION_VERSION, MAX_INTEGER, MAX_SCOPE_TOKENS,
+        PROTOCOL_VERSION,
+    },
     session_index::{
         Association, AssociationProvenance, ContentKey, ContentRegistration, RequestIdentity,
         ResourceKind, SessionIndex,
@@ -254,21 +257,38 @@ fn digest(value: &impl Serialize) -> String {
         )
     )
 }
-fn task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
+fn required_text<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| format!("{field} required"))
+}
+
+fn read_task(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
     Ok(SessionIdentity {
         retirement_generation: Option::<u64>::deserialize(&value["retirement_generation"])
             .map_err(|_| "invalid retirement_generation")?,
         caller_id: caller.into(),
-        session_id: value["session_id"]
-            .as_str()
-            .ok_or("session_id required")?
-            .into(),
-        incarnation: value["incarnation"]
-            .as_str()
-            .ok_or("incarnation required")?
-            .into(),
+        session_id: required_text(value, "session_id")?.into(),
+        incarnation: required_text(value, "incarnation")?.into(),
     })
 }
+fn message_id(value: &Value) -> Option<&str> {
+    value["message_id"]
+        .as_str()
+        .or_else(|| value["event_id"].as_str())
+}
+
+fn read_request(value: &Value) -> Result<RequestIdentity, String> {
+    Ok(RequestIdentity {
+        request_id: required_text(value, "request_id")?.into(),
+        incarnation: required_text(value, "request_incarnation")?.into(),
+    })
+}
+
+fn prepares(event: &Value) -> bool {
+    matches!(event.as_str(), Some("tool_wait" | "prepare" | "resume"))
+}
+
 fn validate_input(value: &Value) -> Result<(), String> {
     const MAX_TIME_MS: u64 = 86_400_000;
     if value
@@ -281,17 +301,15 @@ fn validate_input(value: &Value) -> Result<(), String> {
         return Err("send prepare when the prefetch should start".into());
     }
     for key in ["revision", "branch_revision", "attempt"] {
-        if let Some(number) = value.get(key) {
-            if number
-                .as_u64()
-                .is_none_or(|n| n > crate::protocol::MAX_INTEGER)
-            {
-                return Err(format!("{key} exceeds the safe integer domain"));
-            }
+        if value
+            .get(key)
+            .is_some_and(|n| n.as_u64().is_none_or(|n| n > MAX_INTEGER))
+        {
+            return Err(format!("{key} exceeds the safe integer domain"));
         }
     }
     // Leave a representable successor for closing a session or releasing a PIN.
-    if value["revision"].as_u64() == Some(crate::protocol::MAX_INTEGER) {
+    if value["revision"].as_u64() == Some(MAX_INTEGER) {
         let needs_finish = value["kind"] == "session_event"
             && !matches!(
                 value["event"].as_str(),
@@ -302,22 +320,13 @@ fn validate_input(value: &Value) -> Result<(), String> {
             return Err("revision leaves no room for cleanup".into());
         }
     }
-    if let Some(ttl) = value.get("ttl_seconds").filter(|ttl| !ttl.is_null()) {
-        if ttl
-            .as_f64()
-            .is_none_or(|n| !n.is_finite() || n <= 0.0 || n > 31_536_000.0)
-        {
-            return Err("invalid ttl_seconds".into());
-        }
+    let ttl = &value["ttl_seconds"];
+    if !ttl.is_null() && ttl.as_f64().is_none_or(|n| !(n > 0.0 && n <= 31_536_000.0)) {
+        return Err("invalid ttl_seconds".into());
     }
-    if let Some(priority) = value.get("priority").filter(|priority| !priority.is_null()) {
-        if priority
-            .as_i64()
-            .and_then(|n| i32::try_from(n).ok())
-            .is_none()
-        {
-            return Err("invalid priority".into());
-        }
+    let priority = &value["priority"];
+    if !priority.is_null() && i32::deserialize(priority).is_err() {
+        return Err("invalid priority".into());
     }
     for tokens in [
         value.get("input_ids"),
@@ -336,22 +345,11 @@ fn validate_input(value: &Value) -> Result<(), String> {
             return Err("token capacity/type violation".into());
         }
     }
-    if let Some(revision) = value
-        .get("target")
-        .and_then(|target| target.get("revision"))
+    if value["target"]
+        .get("revision")
+        .is_some_and(|revision| revision.as_u64().is_none_or(|n| n > MAX_INTEGER))
     {
-        if revision
-            .as_u64()
-            .is_none_or(|n| n > crate::protocol::MAX_INTEGER)
-        {
-            return Err("invalid selector revision".into());
-        }
-    }
-    if value["target"]["blocks"]
-        .as_array()
-        .is_some_and(|blocks| blocks.len() > 4096)
-    {
-        return Err("block descriptor capacity".into());
+        return Err("invalid selector revision".into());
     }
     Ok(())
 }
@@ -385,6 +383,14 @@ struct Job {
     polls: u64,
 }
 impl Job {
+    fn clear_residency(&mut self) {
+        self.ready_end = 0;
+        self.ready_at = None;
+    }
+    fn clear_observations(&mut self) {
+        self.clear_residency();
+        self.claim_view = Value::Null;
+    }
     fn never_submitted(&self) -> bool {
         // A release resets submission state for its new message, but the
         // original PIN may still protect the worker's cache.
@@ -577,12 +583,16 @@ impl Actor {
             None => self.workers(),
         }
     }
+    fn read_task(&self, value: &Value) -> Result<SessionIdentity, String> {
+        read_task(value.get("task").unwrap_or(value), &self.config.caller_id)
+    }
     fn receive(&mut self, message: Message) {
         if let Message::Api(value, _) = &message {
             if let Err(reason) = validate_input(value) {
-                if let Message::Api(_, reply) = message {
-                    let _ = reply.send(error("invalid_payload", reason));
-                }
+                let Message::Api(_, reply) = message else {
+                    unreachable!()
+                };
+                let _ = reply.send(error("invalid_payload", reason));
                 return;
             }
         }
@@ -595,13 +605,10 @@ impl Actor {
             Message::Api(value, _) => {
                 let kind = value["kind"].as_str().unwrap_or_default();
                 let event = value["event"].as_str().unwrap_or_default();
-                let demand = task(value.get("task").unwrap_or(value), &self.config.caller_id)
+                let demand = self
+                    .read_task(value)
                     .ok()
-                    .zip(
-                        value["message_id"]
-                            .as_str()
-                            .or_else(|| value["event_id"].as_str()),
-                    )
+                    .zip(message_id(value))
                     .map(|(task, id)| DemandId {
                         task,
                         id: id.into(),
@@ -655,12 +662,7 @@ impl Actor {
         self.apply_message(message);
     }
     fn discover(&mut self, workers: Vec<String>) -> Option<WaitFor> {
-        if workers.iter().any(|url| {
-            self.owners
-                .get(url)
-                .and_then(WorkerOwner::available)
-                .is_some()
-        }) {
+        if workers.iter().any(|url| self.worker_ready(url)) {
             return None;
         }
         for url in &workers {
@@ -668,29 +670,29 @@ impl Actor {
         }
         Some(WaitFor::Workers(workers))
     }
+    fn worker_ready(&self, url: &str) -> bool {
+        self.owners
+            .get(url)
+            .and_then(WorkerOwner::available)
+            .is_some()
+    }
+    fn poll_ready(&self, id: &str, target: u64) -> bool {
+        self.jobs
+            .get(id)
+            .is_none_or(|job| job.polls >= target || self.needs_receipt_only(job))
+    }
     fn wait_ready(&mut self, wait: &WaitFor) -> bool {
         match wait {
             WaitFor::Workers(workers) => {
-                workers.iter().any(|url| {
-                    self.owners
-                        .get(url)
-                        .and_then(WorkerOwner::available)
-                        .is_some()
-                }) || workers.iter().all(|url| !self.busy.contains_key(url))
+                workers.iter().any(|url| self.worker_ready(url))
+                    || workers.iter().all(|url| !self.busy.contains_key(url))
             }
             WaitFor::Jobs(jobs) => {
                 let mut ready = true;
                 for (id, target) in jobs {
-                    if !self
-                        .jobs
-                        .get(id)
-                        .is_none_or(|job| job.polls >= *target || self.needs_receipt_only(job))
-                    {
+                    if !self.poll_ready(id, *target) {
                         self.request_poll(id);
-                        ready &= self
-                            .jobs
-                            .get(id)
-                            .is_none_or(|job| job.polls >= *target || self.needs_receipt_only(job));
+                        ready &= self.poll_ready(id, *target);
                     }
                 }
                 ready
@@ -799,15 +801,12 @@ impl Actor {
             invalidate: false,
             job: None,
         };
-        let cancel = job
-            .as_ref()
-            .is_some_and(|j| self.book.job(&j.id).is_some_and(|b| b.cancel_requested));
-        let request_only = job.as_ref().is_some_and(|j| {
-            self.book.job(&j.id).is_some_and(|b| {
-                b.interests
-                    .iter()
-                    .all(|d| self.intents.get(d).is_some_and(|i| i.request_triggered))
-            })
+        let demand = job.as_ref().and_then(|j| self.book.job(&j.id));
+        let cancel = demand.is_some_and(|b| b.cancel_requested);
+        let request_only = demand.is_some_and(|b| {
+            b.interests
+                .iter()
+                .all(|d| self.intents.get(d).is_some_and(|i| i.request_triggered))
         });
         let shared_pin = cancel
             && job.as_ref().is_some_and(|j| {
@@ -823,9 +822,7 @@ impl Actor {
                         // Discover promptly even when this job keeps the worker busy.
                         poll.refresh().await;
                         job.last_error = Some(reason);
-                        job.ready_end = 0;
-                        job.ready_at = None;
-                        job.claim_view = Value::Null;
+                        job.clear_observations();
                     }
                 }
                 job.polls += 1;
@@ -846,9 +843,7 @@ impl Actor {
         if !(self.workers)().contains(&job.url) {
             let job = self.jobs.get_mut(id).expect("job exists");
             job.polls += 1;
-            job.ready_end = 0;
-            job.ready_at = None;
-            job.claim_view = Value::Null;
+            job.clear_observations();
             job.last_error = Some("worker unavailable".into());
             return;
         }
@@ -889,9 +884,7 @@ impl Actor {
         self.busy.remove(&poll.url);
         if poll.invalidate {
             for job in self.jobs.values_mut().filter(|j| j.url == poll.url) {
-                job.ready_at = None;
-                job.ready_end = 0;
-                job.claim_view = Value::Null;
+                job.clear_observations();
             }
         }
         if let Some(job) = poll.job.filter(|job| {
@@ -920,9 +913,7 @@ impl Actor {
                 job.owner_lost = true;
                 job.last_error = Some("owner_lost".into());
                 job.quiescent = true;
-                job.ready_at = None;
-                job.ready_end = 0;
-                job.claim_view = Value::Null;
+                job.clear_observations();
                 let _ = self.book.mark_quiescent(&job.id);
             }
         }
@@ -992,9 +983,8 @@ impl Actor {
             return Err("no complete page".into());
         }
         let mut parent = None;
-        let mut handles = Vec::new();
-        // Page-prefix digests are adapter identities, not Engine storage keys.
-        // Full content compatibility participates in every digest via ContentKey.
+        // Content keys pair adapter digests with full compatibility. Keep pages
+        // reachable through their parent chain during registration.
         for (i, chunk) in tokens[..end].chunks(page).enumerate() {
             let key = ContentKey::new(
                 compatibility.clone(),
@@ -1009,7 +999,6 @@ impl Actor {
                     suffix_tokens: Some(chunk.to_vec()),
                 })
                 .map_err(|e| format!("{e:?}"))?;
-            handles.push(self.index.content(&key));
             parent = Some(key);
         }
         self.index
@@ -1019,7 +1008,6 @@ impl Actor {
                 branch_id: context.branch_id.clone(),
                 branch_revision: context.branch_revision,
                 content: parent.expect("complete page"),
-                parent_frontier: None,
                 request: Some(context.request()),
                 original_end: Some(original_end as u64),
                 provenance: AssociationProvenance::RenderedRequest,
@@ -1069,65 +1057,49 @@ impl Actor {
             .untrack_resource(&demand.task, ResourceKind::Intent, &demand.id);
     }
     fn forget_intent(&mut self, demand: &DemandId) {
-        if let Some(intent) = self.intents.remove(demand) {
-            for id in intent.jobs {
-                if self.book.forget_job(&id) {
-                    if let Some(job) = self.jobs.remove(&id) {
-                        if let Some(claim_id) = job.payload["claim_id"].as_str() {
-                            if !self
-                                .jobs
-                                .values()
-                                .any(|j| j.payload["claim_id"] == claim_id)
-                            {
-                                let _ = self.index.untrack_resource(
-                                    &demand.task,
-                                    ResourceKind::Claim,
-                                    claim_id,
-                                );
-                            }
-                        }
-                        if self.jobs_by_spec.get(&job.spec) == Some(&id) {
-                            self.jobs_by_spec.remove(&job.spec);
-                        }
-                    }
-                }
+        let Some(intent) = self.intents.remove(demand) else {
+            return;
+        };
+        for id in intent
+            .jobs
+            .into_iter()
+            .filter(|id| self.book.forget_job(id))
+        {
+            let Some(job) = self.jobs.remove(&id) else {
+                continue;
+            };
+            if let Some(claim_id) = job.payload["claim_id"].as_str().filter(|claim_id| {
+                !self
+                    .jobs
+                    .values()
+                    .any(|j| j.payload["claim_id"] == *claim_id)
+            }) {
+                let _ = self
+                    .index
+                    .untrack_resource(&demand.task, ResourceKind::Claim, claim_id);
+            }
+            if self.jobs_by_spec.get(&job.spec) == Some(&id) {
+                self.jobs_by_spec.remove(&job.spec);
             }
         }
     }
     fn resolve(&mut self, target: &Value, task: &SessionIdentity) -> Result<FrozenTarget, String> {
+        if target == "request_cached" {
+            return Err("unsupported selector".into());
+        }
         let selector = match target["kind"].as_str().unwrap_or("session") {
             "session" => Selector::Session(task.clone()),
             "branch" => Selector::Branch {
                 session: task.clone(),
-                branch_id: target["branch_id"]
-                    .as_str()
-                    .ok_or("branch_id required")?
-                    .into(),
+                branch_id: required_text(target, "branch_id")?.into(),
                 revision: target["revision"].as_u64(),
             },
             "request" => Selector::Request {
                 session: task.clone(),
-                request: RequestIdentity {
-                    request_id: target["request_id"]
-                        .as_str()
-                        .ok_or("request_id required")?
-                        .into(),
-                    incarnation: target["request_incarnation"]
-                        .as_str()
-                        .ok_or("request_incarnation required")?
-                        .into(),
-                },
+                request: read_request(target)?,
             },
             "prefix" => {
-                let prefix = PrefixTarget::deserialize(target).map_err(|e| e.to_string())?;
-                // Reuse P1 structural/dependency validation before creating state.
-                let action = Action {
-                    action_id: "validate".into(),
-                    action_type: "sglang.prefetch".into(),
-                    action_version: "1.0".into(),
-                    payload: json!({"target":prefix,"source":{"tier":"storage"},"destination":{"tier":"host"}}),
-                };
-                parse_action(&action).map_err(|e| format!("{e:?}"))?;
+                let prefix = validate_prefix(target).map_err(|e| format!("{e:?}"))?;
                 let key = ContentKey::new(prefix.compatibility.clone(), digest(&prefix))
                     .map_err(|e| format!("{e:?}"))?;
                 self.index
@@ -1161,7 +1133,7 @@ impl Actor {
     }
     fn api(&mut self, value: Value) -> Value {
         let event = if value["kind"] == "session_event" {
-            task(value.get("task").unwrap_or(&value), &self.config.caller_id)
+            self.read_task(&value)
                 .ok()
                 .zip(value["event_id"].as_str())
                 .map(|(task, id)| {
@@ -1174,6 +1146,8 @@ impl Actor {
         } else {
             None
         };
+        let prepares_prefix = prepares(&value["event"]);
+        let revision = value["revision"].as_u64();
         let closing = matches!(
             value["event"].as_str(),
             Some("task_finished" | "task_cancelled")
@@ -1193,18 +1167,16 @@ impl Actor {
             if !closing && self.events.len() >= self.config.max_operations {
                 return error("capacity", "lifecycle replay budget exhausted");
             }
-            if matches!(
-                value["event"].as_str(),
-                Some("tool_wait" | "prepare" | "resume")
-            ) && self.index.session_revision(&key.task).is_some_and(|r| {
-                value["revision"]
-                    .as_u64()
-                    .is_none_or(|revision| revision <= r)
-            }) {
+            if prepares_prefix
+                && self
+                    .index
+                    .session_revision(&key.task)
+                    .is_some_and(|current| revision.is_none_or(|revision| revision <= current))
+            {
                 return error("conflict", "stale lifecycle revision");
             }
         }
-        let result = match self.apply(value.clone()) {
+        let result = match self.apply(value) {
             Ok(data) => ok(data),
             Err(e) => error(
                 if e.to_lowercase().contains("capacity") {
@@ -1217,13 +1189,10 @@ impl Actor {
         };
         if result["success"] == true {
             if let Some((key, fingerprint)) = event {
-                if matches!(
-                    value["event"].as_str(),
-                    Some("tool_wait" | "prepare" | "resume")
-                ) {
+                if prepares_prefix {
                     let _ = self
                         .index
-                        .advance_revision(&key.task, value["revision"].as_u64().unwrap_or(0));
+                        .advance_revision(&key.task, revision.unwrap_or(0));
                 }
                 // Receipt expiry does not change session revisions or tombstones.
                 let expires = Instant::now() + Duration::from_millis(self.config.operation_ttl_ms);
@@ -1257,7 +1226,7 @@ impl Actor {
             .collect()
     }
     fn apply(&mut self, value: Value) -> Result<Value, String> {
-        let kind = value["kind"].as_str().ok_or("kind required")?;
+        let kind = required_text(&value, "kind")?;
         if kind == "feedback" {
             return Ok(json!({"owners": self.owners()}));
         }
@@ -1274,11 +1243,8 @@ impl Actor {
                 "index": format!("{:?}", self.index.usage())
             }));
         }
-        let task = task(value.get("task").unwrap_or(&value), &self.config.caller_id)?;
-        let id = value["message_id"]
-            .as_str()
-            .or_else(|| value["event_id"].as_str())
-            .unwrap_or("");
+        let task = self.read_task(&value)?;
+        let id = message_id(&value).unwrap_or("");
         if id.is_empty() || id.len() > self.config.limits.max_identifier_bytes {
             return Err("message_id/event_id required within identifier budget".into());
         }
@@ -1335,13 +1301,13 @@ impl Actor {
                 Ok(json!({"acknowledged":true}))
             }
             "session_event" => {
-                let event = value["event"].as_str().ok_or("event required")?;
+                let event = required_text(&value, "event")?;
                 let revision = value["revision"].as_u64().ok_or("revision required")?;
                 match event {
                     "task_started" => {
                         let parent = value
                             .get("parent")
-                            .map(|p| task_fn(p, &self.config.caller_id))
+                            .map(|p| read_task(p, &self.config.caller_id))
                             .transpose()?;
                         self.index
                             .start_session_at(task, parent, revision)
@@ -1360,10 +1326,10 @@ impl Actor {
                         for ended in &cleanup.tasks {
                             self.book.release_task(ended);
                             self.last_route.remove(ended);
-                            for (d, i) in self.intents.iter_mut().filter(|(d, _)| &d.task == ended)
+                            for (_, intent) in
+                                self.intents.iter_mut().filter(|(d, _)| &d.task == ended)
                             {
-                                let _ = d;
-                                i.released = true;
+                                intent.released = true;
                             }
                         }
                         Ok(
@@ -1374,31 +1340,22 @@ impl Actor {
                     "request_observed" => {
                         let tokens: Vec<u32> = serde_json::from_value(value["input_ids"].clone())
                             .map_err(|e| e.to_string())?;
-                        if tokens.len() > MAX_SCOPE_TOKENS {
-                            return Err("token capacity".into());
-                        }
+                        let branch_id = required_text(&value, "branch_id")?.into();
+                        let branch_revision = value["branch_revision"]
+                            .as_u64()
+                            .ok_or("branch_revision required")?;
+                        let request = read_request(&value)?;
                         let context = KvContext {
                             retirement_generation: task.retirement_generation,
                             session_id: task.session_id.clone(),
                             incarnation: task.incarnation.clone(),
-                            branch_id: value["branch_id"]
-                                .as_str()
-                                .ok_or("branch_id required")?
-                                .into(),
+                            branch_id,
                             revision,
-                            branch_revision: value["branch_revision"]
-                                .as_u64()
-                                .ok_or("branch_revision required")?,
-                            request_id: value["request_id"]
-                                .as_str()
-                                .ok_or("request_id required")?
-                                .into(),
-                            request_incarnation: value["request_incarnation"]
-                                .as_str()
-                                .ok_or("request_incarnation required")?
-                                .into(),
+                            branch_revision,
+                            request_id: request.request_id,
+                            request_incarnation: request.incarnation,
                         };
-                        let worker = value["worker_url"].as_str().ok_or("worker_url required")?;
+                        let worker = required_text(&value, "worker_url")?;
                         self.record(
                             context,
                             tokens.len(),
@@ -1410,16 +1367,7 @@ impl Actor {
                         Ok(json!({"state":"associated","residency":"unknown"}))
                     }
                     "request_finished" => {
-                        let r: RequestIdentity = RequestIdentity {
-                            request_id: value["request_id"]
-                                .as_str()
-                                .ok_or("request_id required")?
-                                .into(),
-                            incarnation: value["request_incarnation"]
-                                .as_str()
-                                .ok_or("request_incarnation required")?
-                                .into(),
-                        };
+                        let r = read_request(&value)?;
                         self.index
                             .forget_request(&task, &r, revision)
                             .map_err(|e| format!("{e:?}"))?;
@@ -1436,9 +1384,9 @@ impl Actor {
                         } else {
                             ("sglang.prefetch", "storage", "host")
                         };
-                        let mut command = value.clone();
+                        let mut command = value;
                         command["kind"] = json!("submit");
-                        command["message_id"] = json!(id);
+                        command["message_id"] = json!(demand.id);
                         command["action"] = json!(action);
                         command["source"] = json!({"tier":source});
                         command["destination"] = json!({"tier":destination});
@@ -1498,7 +1446,7 @@ impl Actor {
         }
 
         drop(unique);
-        let action = value["action"].as_str().ok_or("action required")?;
+        let action = required_text(&value, "action")?;
         if !matches!(action, "sglang.prefetch" | "sglang.demote" | "sglang.pin") {
             return Err("unsupported action".into());
         }
@@ -1554,7 +1502,7 @@ impl Actor {
                     && if action == "sglang.pin" {
                         c.public["actions"][action]
                             .as_array()
-                            .is_some_and(|a| a.iter().any(|v| v == "1.0"))
+                            .is_some_and(|a| a.iter().any(|v| v == ACTION_VERSION))
                             && (value["priority"].is_null()
                                 || c.public["pin_protections"].as_array().is_some_and(|ps| {
                                     ps.iter().any(|p| {
@@ -1568,16 +1516,6 @@ impl Actor {
                 missing.push("no healthy compatible executable worker".into());
                 continue;
             };
-            let mut src = value["source"].clone();
-            let mut dst = value["destination"].clone();
-            for location in [&mut src, &mut dst] {
-                if location["tier"] == "storage" {
-                    location["backend"] = caps.public["storage_backend"].clone();
-                    location["backend_namespace"] = caps.public["backend_namespace"].clone();
-                } else if location.is_object() {
-                    location["engine_id"] = json!(caps.engine_id);
-                }
-            }
             let payload = if action == "sglang.pin" {
                 let mut payload = json!({"target":prefix,"location":{"tier":pin_tier,"engine_id":caps.engine_id},"mode":value["mode"],
                 "claim_id":format!("claim-{}",digest(&(self.config.caller_id.as_str(),&task,&value["claim_id"],&prefix))),"revision":value["revision"],
@@ -1589,16 +1527,11 @@ impl Actor {
                 }
                 payload
             } else {
+                let src = caps.bind_location(value["source"].clone());
+                let dst = caps.bind_location(value["destination"].clone());
                 json!({"target":prefix,"source":src,"destination":dst,"allow_partial":value["allow_partial"].as_bool().unwrap_or(false),"timeout_ms":self.config.operation_ttl_ms})
             };
-            let parsed = Action {
-                action_id: "transfer".into(),
-                action_type: action.into(),
-                action_version: "1.0".into(),
-                payload,
-            };
-            parse_action(&parsed).map_err(|e| format!("{e:?}"))?;
-            let payload = parsed.payload;
+            parse_engine_action(action, &payload).map_err(|e| format!("{e:?}"))?;
             // Share the live job for this spec, never a released job's receipt.
             // A fresh job gets its own Engine message identity, even while a
             // previous task still holds an unacknowledged receipt.
@@ -1884,17 +1817,7 @@ impl WorkerPoll {
             job.quiescent = true;
             return Ok(());
         }
-        if job.needs_first_submission() {
-            if Instant::now() >= job.deadline {
-                job.quiescent = true;
-                return Err("expired before submission".into());
-            }
-            // Capabilities already selected the owner; the Engine validates
-            // its epoch on submit. Skip a redundant probe on this short path.
-            self.submit_action(job).await?;
-            job.last_error = None;
-            return Ok(());
-        }
+        let first_submission = job.needs_first_submission();
         if cancel
             && job.action == "sglang.pin"
             && job.payload["mode"] != "release"
@@ -1934,6 +1857,11 @@ impl WorkerPoll {
                 return Err("expired before submission".into());
             }
             self.submit_action(job).await?;
+            if first_submission {
+                // The Engine validates the selected owner's epoch on submit.
+                job.last_error = None;
+                return Ok(());
+            }
         }
         if cancel && !job.releasing_pin && !job.cancel_sent && !job.has_terminal_result() {
             if let Some(reference) = &job.operation_ref {
@@ -1963,8 +1891,7 @@ impl WorkerPoll {
             included_claim = reply.get("claim").cloned();
             self.update_result(job, reply)?;
         }
-        job.ready_end = 0;
-        job.ready_at = None;
+        job.clear_residency();
         if job.action == "sglang.pin" {
             self.observe_pin(job, included_claim, cancel).await?;
         }
@@ -2006,8 +1933,8 @@ impl WorkerPoll {
         // Retry the same envelope after a lost response.
         job.attempted = true;
         let reply = self.client.command(&job.url, &json!({"kind":"submit","context":job.context,
-            "envelope":{"protocol_version":"0.1","message_id":job.message_id,"actions":[{
-                "action_id":"transfer","action_type":job.action,"action_version":"1.0","payload":job.payload.as_ref()
+            "envelope":{"protocol_version":PROTOCOL_VERSION,"message_id":job.message_id,"actions":[{
+                "action_id":"transfer","action_type":job.action,"action_version":ACTION_VERSION,"payload":job.payload.as_ref()
             }]}})).await?;
         self.update_result(job, reply)?;
         job.submitted = true;
@@ -2038,13 +1965,29 @@ impl WorkerPoll {
         Ok(())
     }
 }
-fn task_fn(value: &Value, caller: &str) -> Result<SessionIdentity, String> {
-    task(value, caller)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_returns_scanner_negative_invalid_json_without_parsing() {
+        let (tx, _rx) = mpsc::channel(1);
+        let config =
+            serde_json::from_str(include_str!("../../kv-orchestration.example.json")).unwrap();
+        let runtime = Runtime {
+            tx,
+            dropped_routes: Arc::new(AtomicU64::new(0)),
+            config,
+        };
+        let body = Bytes::from_static(br#"{"incomplete": "#);
+        assert!(!may_have_kv_context(&body));
+        assert!(serde_json::from_slice::<Value>(&body).is_err());
+        let (returned, context) = runtime.extract(body.clone()).unwrap();
+        assert_eq!(returned.as_ptr(), body.as_ptr());
+        assert_eq!(returned, body);
+        assert!(context.is_none());
+    }
 
     #[test]
     fn metadata_scan_handles_ordinary_text_and_escaped_keys() {

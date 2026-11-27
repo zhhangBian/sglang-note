@@ -3752,7 +3752,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "futures",
- "jsonschema",
  "reqwest",
  "serde",
  "serde_json",

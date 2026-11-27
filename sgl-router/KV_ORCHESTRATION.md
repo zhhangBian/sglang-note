@@ -24,10 +24,16 @@ destination Engines.
 | `sglang.demote` | Preserve a host prefix in storage and reclaim the eligible host range. The result separates these outcomes. |
 
 Applications can submit these actions directly with `POST /v1/kv/control`. A
-command carries a task identity, an idempotent message ID, and a target. Targets
-can select a session, branch, observed request, or compatible prefix. Session
-and branch selectors freeze their current scope when the command is accepted.
-Use Engine capabilities to check which transfer directions the worker supports.
+command carries a task identity and an idempotent message ID. A target object
+can select a session, branch, observed request, or compatible prefix. The
+default target is the session. Session and branch selectors freeze their scope
+at acceptance. Use Engine capabilities to check supported transfer directions.
+
+The Router discovers capabilities with `GET /v1/kv/capabilities` and sends
+version `1.0` actions to the Engine's `POST /v1/kv/control`. It sends concrete
+`prefix` targets with token IDs and compatibility on submit, and `tokens`
+targets on residency reads. PIN cleanup uses the Router task's locally tracked
+claims. A PIN command carries its claim ID, revision, and Engine location.
 
 For example, after registering a task and observing its branch, pin its host
 prefix on the worker that owns it:
@@ -87,8 +93,13 @@ receipt. Cancel and acknowledge the old interest to reclaim its operation slot.
 For a passive association, the Router records caller token IDs or tokens from
 the rendered chat template. Its scope reports the original input length in
 `original_end` and the page-aligned prefix length in `controlled_end` (up to
-65,536 tokens). A live claim lookup reports PIN protection. A scoped residency
-read reports PREFETCH coverage with the Engine's current cache watermark.
+65,536 tokens). The Engine receives the full inference input. A live claim
+lookup reports PIN protection. A scoped residency read reports PREFETCH
+coverage with the Engine's current cache watermark. Inline watermarks in
+Engine replies can invalidate earlier readiness while terminal operation
+receipts remain available for acknowledgement.
+
+Send `kv_context` on `/v1/responses` to associate the converted chat request.
 
 For request-triggered prefetch, send `kv_context` on a generation request along
 with `x-kv-control-authorization: Bearer <control_bearer>`. The Router consumes

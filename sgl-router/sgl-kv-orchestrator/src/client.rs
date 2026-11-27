@@ -1,5 +1,8 @@
 //! Bounded Engine HTTP adapter. Control responses never become residency evidence.
-use crate::models::{Compatibility, PrefixTarget};
+use crate::{
+    models::{Compatibility, PrefixTarget},
+    protocol::ACTION_VERSION,
+};
 use bytes::BytesMut;
 use futures::StreamExt;
 use reqwest::{header::HeaderValue, Client};
@@ -101,10 +104,19 @@ impl Capabilities {
         expected.components.sort();
         actual == expected
     }
+    pub fn bind_location(&self, mut location: Value) -> Value {
+        if location["tier"] == "storage" {
+            location["backend"] = self.public["storage_backend"].clone();
+            location["backend_namespace"] = self.public["backend_namespace"].clone();
+        } else if location.is_object() {
+            location["engine_id"] = json!(self.engine_id);
+        }
+        location
+    }
     pub fn path(&self, action: &str, source: &str, destination: &str) -> bool {
         self.public["actions"][action]
             .as_array()
-            .is_some_and(|a| a.iter().any(|v| v == "1.0"))
+            .is_some_and(|a| a.iter().any(|v| v == ACTION_VERSION))
             && self.public["paths"][action]
                 .as_array()
                 .is_some_and(|paths| paths.iter().any(|v| v == &json!([source, destination])))
@@ -154,7 +166,7 @@ impl EngineClient {
             }
             bytes.extend_from_slice(&chunk);
         }
-        let value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let mut value: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let claim_lookup = body.is_some_and(|command| command["kind"] == "claim");
         if claim_lookup
             && status == reqwest::StatusCode::NOT_FOUND
@@ -170,7 +182,7 @@ impl EngineClient {
         if claim_lookup && !value["data"].is_object() {
             return Err("engine returned an invalid claim".into());
         }
-        Ok(value["data"].clone())
+        Ok(value["data"].take())
     }
     pub async fn capabilities(&self, url: &str) -> Result<Capabilities, String> {
         Capabilities::parse(self.request(url, None).await?)
@@ -270,7 +282,6 @@ mod tests {
             start_token: 0,
             end_token: 64,
             token_ids: Some(vec![1; 64]),
-            blocks: vec![],
         };
         assert!(caps.compatible(&prefix));
         assert_eq!(

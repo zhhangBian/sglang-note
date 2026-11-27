@@ -14,7 +14,7 @@ pub enum BookError {
     Conflict,
     Unknown,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct JobInterest {
     pub interests: BTreeSet<DemandId>,
     pub cancel_requested: bool,
@@ -65,11 +65,7 @@ impl DemandBook {
         for id in &jobs {
             self.jobs
                 .entry(id.clone())
-                .or_insert_with(|| JobInterest {
-                    interests: BTreeSet::new(),
-                    cancel_requested: false,
-                    quiescent: false,
-                })
+                .or_default()
                 .interests
                 .insert(demand.clone());
         }
@@ -78,14 +74,12 @@ impl DemandBook {
     }
     pub fn release(&mut self, demand: &DemandId) -> Vec<String> {
         let mut cancel = Vec::new();
-        if let Some(jobs) = self.demands.remove(demand) {
-            for id in jobs {
-                if let Some(job) = self.jobs.get_mut(&id) {
-                    job.interests.remove(demand);
-                    if job.interests.is_empty() {
-                        job.cancel_requested = true;
-                        cancel.push(id);
-                    }
+        for id in self.demands.remove(demand).into_iter().flatten() {
+            if let Some(job) = self.jobs.get_mut(&id) {
+                job.interests.remove(demand);
+                if job.interests.is_empty() {
+                    job.cancel_requested = true;
+                    cancel.push(id);
                 }
             }
         }

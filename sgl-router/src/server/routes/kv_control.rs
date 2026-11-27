@@ -28,14 +28,11 @@ async fn call(ctx: Arc<AppContext>, headers: HeaderMap, mut body: Value, event: 
         body["kind"] = json!("session_event");
     }
     let result = runtime.api(body).await;
-    let status = if result["success"] == true {
-        StatusCode::OK
-    } else {
-        match result["error"]["code"].as_str() {
-            Some("capacity") => StatusCode::TOO_MANY_REQUESTS,
-            Some("unknown") => StatusCode::SERVICE_UNAVAILABLE,
-            _ => StatusCode::BAD_REQUEST,
-        }
+    let status = match result["error"]["code"].as_str() {
+        _ if result["success"] == true => StatusCode::OK,
+        Some("capacity") => StatusCode::TOO_MANY_REQUESTS,
+        Some("unknown") => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_REQUEST,
     };
     (status, Json(result)).into_response()
 }

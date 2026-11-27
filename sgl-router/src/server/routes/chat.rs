@@ -432,29 +432,31 @@ impl<'a> ModelRouting<'a> {
             }
             let duration = duration
                 .get_or_insert_with(|| RequestDurationGuard::new(ctx, &request.model, start));
-            let selected_url = workers.prefill.url.clone();
+            let selected_url = ctx
+                .orchestration
+                .as_ref()
+                .map(|_| workers.prefill.url.clone());
             if let (Some(runtime), Some(context)) = (&ctx.orchestration, &kv_context) {
+                let prefetch = runtime
+                    .request_prefetch_authorized(&headers)
+                    .then(|| request.prefetch_prefix_len())
+                    .flatten();
                 runtime.routed(
                     context,
-                    &selected_url,
+                    &workers.prefill.url,
                     request.association_tokens(),
                     request.cache_namespace.cache_salt.as_deref(),
-                    runtime
-                        .request_prefetch_authorized(&headers)
-                        .then(|| request.prefetch_prefix_len())
-                        .flatten(),
+                    prefetch,
                 );
             }
             let mut attempt =
                 forward_request(ctx, &mut request, workers, headers.clone(), start, duration)
                     .await?;
-            if ctx.orchestration.is_some() {
-                if let Ok(value) = axum::http::HeaderValue::from_str(&selected_url) {
-                    attempt
-                        .response
-                        .headers_mut()
-                        .insert("x-sgl-worker-url", value);
-                }
+            if let Some(value) = selected_url
+                .as_deref()
+                .and_then(|url| axum::http::HeaderValue::from_str(url).ok())
+            {
+                attempt.response.headers_mut().insert("x-sgl-worker-url", value);
             }
             if attempt.retry_excluding.is_empty() {
                 return Ok(attempt.response);

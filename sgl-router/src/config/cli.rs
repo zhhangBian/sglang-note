@@ -684,20 +684,19 @@ impl Cli {
             .as_deref()
             .map(|key| bearer(key, "--worker-management-api-key"))
             .transpose()?;
+        let orchestration = self
+            .server
+            .kv_orchestration_config
+            .map(|path| {
+                let config: crate::orchestration::OrchestrationConfig =
+                    serde_json::from_slice(&std::fs::read(path)?)?;
+                config.validate()?;
+                Ok::<_, anyhow::Error>(config)
+            })
+            .transpose()?;
         let config = Config {
             server: ServerConfig {
-                orchestration: self
-                    .server
-                    .kv_orchestration_config
-                    .map(
-                        |path| -> Result<crate::orchestration::OrchestrationConfig> {
-                            let config: crate::orchestration::OrchestrationConfig =
-                                serde_json::from_slice(&std::fs::read(path)?)?;
-                            config.validate()?;
-                            Ok(config)
-                        },
-                    )
-                    .transpose()?,
+                orchestration,
                 host: self.server.host,
                 port: self.server.port,
                 grpc_port: self.server.grpc_port,
