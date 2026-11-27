@@ -62,6 +62,13 @@ class StorageAttachment:
         """
         cache = self._cache
 
+        service = getattr(cache, "kv_control_service", None)
+        if service is not None and service.has_pending:
+            return (
+                False,
+                "Programmable KV operations must drain before changing storage.",
+            )
+
         # Validate first: a rejected request must have no side effects.
         invalid = self._validate_policies(
             hicache_storage_prefetch_policy, hicache_write_policy
@@ -221,6 +228,12 @@ class StorageAttachment:
            is what hands them back to the pool and its sidecars.
         """
         cache = self._cache
+        service = getattr(cache, "kv_control_service", None)
+        if service is not None and service.has_pending:
+            return (
+                False,
+                "Programmable KV operations must drain before detaching storage.",
+            )
         controller = cache.cache_controller
         if controller is None:
             return False, "HiCache storage backend is not initialized."
@@ -463,6 +476,9 @@ class StorageAttachment:
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
+        reads = cache._native_storage_reads()
+        if reads is not None:
+            reads.clear_admission_holds()
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

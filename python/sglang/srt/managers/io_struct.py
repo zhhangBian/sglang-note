@@ -2074,6 +2074,16 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class KVControlReqInput(BaseReq, kw_only=True):
+    request_id: str
+    command: Dict[str, Any]
+
+
+class KVControlReqOutput(BaseReq, kw_only=True):
+    request_id: str
+    result: Dict[str, Any]
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
@@ -2373,7 +2383,8 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
 
 
 class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
@@ -2405,7 +2416,8 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class BeginWeightUpdateReqInput(BaseReq, kw_only=True):

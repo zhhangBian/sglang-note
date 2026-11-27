@@ -266,6 +266,17 @@ class FullComponent(TreeComponent):
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict host leaves to free KV host pool space."""
+        state = self.tree_core.control_state
+        if state is not None and state.host_priorities:
+            from sglang.srt.mem_cache.unified_cache.control_protection import (
+                evict_by_host_priority,
+            )
+
+            self._ensure_eviction_strategy()
+            evict_by_host_priority(
+                self, num_tokens, tracker, device_frees, host_frees, cache_actions
+            )
+            return
         self._ensure_eviction_strategy()
         if tracker[self.component_type] >= num_tokens:
             return

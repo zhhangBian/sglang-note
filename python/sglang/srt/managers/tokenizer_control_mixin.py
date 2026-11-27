@@ -9,7 +9,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.communicator import FanOutCommunicator
@@ -49,6 +48,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KVControlReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -117,6 +117,7 @@ logger = logging.getLogger(__name__)
 # Each entry creates self.{prefix}_communicator and registers
 # response_type -> communicator.handle_recv in the dispatch table.
 _COMMUNICATOR_SPECS = [
+    ("kv_control", KVControlReqOutput),
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
@@ -201,10 +202,18 @@ class TokenizerControlMixin:
                 self._dispatch_to_scheduler,
                 get_parallel().num_dp_ranks,
                 mode,
+                correlation_key=(lambda obj: obj.request_id)
+                if resp_type is KVControlReqOutput
+                else None,
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    async def kv_control(self: TokenizerManager, command: Dict[str, Any]):
+        from sglang.srt.managers.kv_control.service import send_tokenizer_control
+
+        return await send_tokenizer_control(self, command)
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -873,7 +882,10 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        await self.resume_memory_occupation_communicator(obj)
+        results = await self.resume_memory_occupation_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise ValueError(message)
 
     async def collective_rpc(self: TokenizerManager, obj: RpcReqInput) -> RpcReqOutput:
         self.auto_create_handle_loop()
@@ -1068,7 +1080,10 @@ class TokenizerControlMixin:
         self: TokenizerManager, obj: UpdateWeightVersionReqInput
     ) -> None:
         self.auto_create_handle_loop()
-        await self.update_weight_version_communicator(obj)
+        results = await self.update_weight_version_communicator(obj)
+        success, message = FanOutCommunicator.merge_results(results)
+        if not success:
+            raise ValueError(message)
         self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(

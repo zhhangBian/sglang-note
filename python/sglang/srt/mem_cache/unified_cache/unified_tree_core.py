@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional, Sequence
 
 import msgspec
 import torch
-
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -507,6 +506,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
+        self.control_state = None
+        if params.kv_control_config is not None:
+            from sglang.srt.mem_cache.unified_cache.control_state import (
+                CacheControlState,
+            )
+
+            self.control_state = CacheControlState(params.kv_control_config)
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
         )
@@ -558,6 +564,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        if self.control_state is not None:
+            self.control_state.reset()
         # End suspended walks while their session-cursor sentinels still
         # belong to the old LRUs, clearing any pending internal victim.
         for component in self.components:
@@ -2233,6 +2241,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
                 and self.is_write_back
                 and component_type == BASE_COMPONENT_TYPE
+                and not (self.control_state and self.control_state.host_priorities)
             ):
                 self._reclaim_full_host_duplicates(
                     num_tokens,
@@ -2271,6 +2280,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
+        *,
+        host_priorities: dict[int, int] | None = None,
     ) -> None:
         """Reclaim Full host duplicates until num_tokens are freed; pass 1
         spares evictable D-leaves (imminent free demotes), pass 2 takes them."""
@@ -2285,6 +2296,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 # Queued victims count as demoted.
                 if cd.value is None or cd.host_value is None or node.write_back_queued:
                     swept_ids.append(node.id)  # stale entry
+                    continue
+                if host_priorities and int(cd.host_value[0]) in host_priorities:
                     continue
                 if spare_imminent_demotes and self._is_device_walk_candidate(node):
                     continue
@@ -2343,6 +2356,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
         cache_actions: list[CacheAction | ComponentAction],
+        *,
+        prune_ancestors: bool = True,
     ) -> None:
         """Atomically evict all components on a host leaf.
 
@@ -2363,9 +2378,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
         self._remove_leaf_from_parent(node)
-        self._iteratively_delete_tombstone_leaf(
-            node, tracker, device_frees, host_frees, cache_actions=cache_actions
+        if prune_ancestors:
+            self._iteratively_delete_tombstone_leaf(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+        else:
+            self._update_evictable_leaf_sets(node.parent)
+
+    def evict_host_leaf(self, node_id: NodeId) -> DriveHostEvictionResult:
+        """Evict exactly one H-leaf without reclaiming any ancestor's data.
+
+        The owner must first confirm preservation and release its own holds.
+        Callers may walk a selected suffix backwards, rechecking each node.
+        """
+        result = DriveHostEvictionResult()
+        self._evict_host_leaf(
+            self.node_by_id(node_id),
+            result.tracker,
+            result.device_frees,
+            result.host_frees,
+            result.cache_actions,
+            prune_ancestors=False,
         )
+        return result
 
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Release a node's device KV once its host copy exists; the node stays in the

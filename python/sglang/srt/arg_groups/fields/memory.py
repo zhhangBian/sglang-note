@@ -22,6 +22,13 @@ class Memory(msgspec.Struct):
     """Namespace ``memory``."""
 
     _NS_PATH = "memory"
+    kv_control_config: A[
+        Optional[Dict[str, Any]],
+        Arg(
+            help="Enable standalone Engine KV cache control (PIN, PREFETCH, DEMOTE) with a JSON object containing the model/weight namespace, optional engine_id and bounded limits.",
+            type_parser=json.loads,
+        ),
+    ] = None
     radix_eviction_policy: A[
         str,
         Arg(

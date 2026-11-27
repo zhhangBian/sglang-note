@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Declared native storage execution profiles; I/O stays in HiCache workers.
+
+Adapters bind a concrete backend instance, physical layout and protection domain.
+Storage namespace identity covers the backend key layout and configuration.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import socket
+
+import msgspec
+import torch
+from sglang.srt.managers.kv_control.contracts import ControlError, Location
+from sglang.srt.mem_cache.hicache_storage import HiCacheFile
+
+
+class StorageExecutionAdapter:
+    prefetch_paths = (("storage", "host"),)
+    demote_paths = (("host", "storage"),)
+
+    def __init__(self, store, pool, domain):
+        self.store, self.pool = store, pool
+        # Pool capacity and worker epoch are intentionally absent. Byte layout
+        # and key suffixes must agree across independent compatible engines.
+        layout = (
+            type(pool).__name__,
+            pool.layout,
+            str(pool.dtype),
+            pool.page_size,
+            pool.layer_num,
+            pool.start_layer,
+            pool.end_layer,
+            pool.size_per_token,
+            getattr(pool, "head_num", None),
+            getattr(pool, "head_dim", None),
+        )
+        self.backend_namespace = (
+            "sglang.storage.v1:"
+            + hashlib.sha256(
+                msgspec.json.encode((self.backend, domain, layout))
+            ).hexdigest()
+        )
+
+    def location(self):
+        return Location(
+            tier="storage",
+            backend=self.backend,
+            backend_namespace=self.backend_namespace,
+        )
+
+
+class FileExecutionAdapter(StorageExecutionAdapter):
+    backend = "file"
+    profile = "native_full_file_v1"
+
+    def __init__(self, store, pool):
+        super().__init__(
+            store,
+            pool,
+            (
+                socket.gethostname(),
+                os.path.realpath(store.file_path),
+                store._get_component_keys(""),
+            ),
+        )
+        # Legacy positive metadata can outlive another writer's eviction.
+        # Destructive host moves require fresh backend existence checks;
+        # unified file chunks already bypass that cache and validate sizes.
+        if store.metadata_cache is not None and store._unified_suffixes is None:
+            self.demote_paths = ()
+
+
+class MooncakeExecutionAdapter(StorageExecutionAdapter):
+    backend = "mooncake"
+    profile = "tp1_full_mha_page_first_direct_v1"
+
+    def __init__(self, store, pool):
+        config = store.storage_config
+        if (
+            config is None
+            or any(
+                v != 1
+                for v in (
+                    config.pp_size,
+                    config.attn_cp_size,
+                    config.dcp_size,
+                )
+            )
+            or store.is_mla_backend
+            or store.should_split_heads
+            or config.unified_suffixes is not None
+            or pool.layout != "page_first_direct"
+        ):
+            raise ControlError(
+                "unsupported",
+                "Mooncake control requires FULL MHA page_first_direct within one TP group",
+            )
+        # Use exactly the writer's tag and K/V/rank expansion. Probe only buffer
+        # metadata, without allocating, reading or writing the first host page.
+        keys, _, sizes = store._batch_preprocess(
+            store._tag_keys([""]), torch.arange(pool.page_size, dtype=torch.int64)
+        )
+        if len(keys) != 2 or any(type(n) is not int or n <= 0 for n in sizes):
+            raise ControlError(
+                "unsupported", "Unsupported Mooncake physical page layout"
+            )
+        tp_size = config.tp_size
+        c = store.config
+        super().__init__(
+            store,
+            pool,
+            (
+                c.master_server_address,
+                c.metadata_server,
+                c.tenant_id,
+                self._page_keys(store, "", tp_size) if tp_size > 1 else keys,
+                sizes * tp_size,
+            ),
+        )
+        if tp_size > 1:
+            self.profile = "tp_full_mha_page_first_direct_v1"
+
+    @staticmethod
+    def _page_keys(store, hash_value, tp_size):
+        key = store._tag_keys([hash_value])
+        return [
+            name for rank in range(tp_size) for name in store.mha_page_keys(key, rank)
+        ]
+
+
+# Explicit registration: an arbitrary HiCache backend does not acquire native
+# control support merely by implementing generic read/write methods.
+_ADAPTERS = {"file": FileExecutionAdapter, "mooncake": MooncakeExecutionAdapter}
+
+
+def storage_execution_adapter(cache) -> tuple[StorageExecutionAdapter | None, str]:
+    controller = cache.cache_controller
+    backend = controller.storage_backend_type
+    factory = _ADAPTERS.get(backend)
+    if factory is None:
+        return None, "Storage backend has no registered control adapter"
+    store = controller.storage_backend
+    if backend == "file":
+        valid = isinstance(store, HiCacheFile)
+    else:
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        valid = isinstance(store, MooncakeStore)
+    if not valid:
+        return None, "Storage backend instance does not match its adapter"
+    if backend == "file" and cache.tp_world_size > 1:
+        return None, "Rank-sharded control requires the Mooncake adapter"
+    try:
+        return factory(store, cache.host_pool_group.anchor_entry.host_pool), ""
+    except ControlError as error:
+        return None, str(error)

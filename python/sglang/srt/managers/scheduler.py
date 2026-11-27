@@ -774,6 +774,10 @@ class Scheduler(
 
         self.init_weight_updater()
 
+        from sglang.srt.managers.kv_control.service import create_scheduler_service
+
+        self.kv_control_service = create_scheduler_service(self.tree_cache)
+
         # Init request dispatcher
         self.init_request_dispatcher()
 
@@ -1998,8 +2002,12 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        from sglang.srt.managers.io_struct import KVControlReqInput
+        from sglang.srt.managers.kv_control.service import scheduler_control_handler
+
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                (KVControlReqInput, scheduler_control_handler(self.kv_control_service)),
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -2396,6 +2404,8 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
+        if getattr(self, "kv_control_service", None) is not None:
+            self.kv_control_service.progress()
 
         for recv_req in recv_reqs:
             # Before any early exit, so every request releases its CUDA IPC pool slot.
@@ -2771,6 +2781,12 @@ class Scheduler(
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+            kv_control=(
+                self.kv_control_service
+                if self.kv_control_service is not None
+                and self.kv_control_service.tp_group is not None
+                else None
+            ),
         )
 
     def init_dp_attn_adapter(self) -> None:
@@ -3312,6 +3328,9 @@ class Scheduler(
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
+        from sglang.srt.managers.kv_control.service import namespace_cache_salt
+
+        namespace_cache_salt(getattr(self, "kv_control_service", None), req)
         if (
             get_exec().moe.elastic_ep_backend is None
             or not self.tree_cache.supports_prefix_sharing()
@@ -6245,6 +6264,8 @@ class Scheduler(
         idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
+            if getattr(self, "kv_control_service", None) is not None:
+                idle &= not self.kv_control_service.has_pending
             idle &= not self.request_receiver.has_pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
@@ -6405,6 +6426,8 @@ class Scheduler(
                     },
                 )
             self.tree_cache.reset()
+            if getattr(self, "kv_control_service", None) is not None:
+                self.kv_control_service.reset_after_cache_flush()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
@@ -6577,6 +6600,10 @@ class Scheduler(
     def handle_update_weight_version(
         self, recv_req: UpdateWeightVersionReqInput
     ) -> UpdateWeightVersionReqOutput:
+        if getattr(self, "kv_control_service", None) is not None:
+            return UpdateWeightVersionReqOutput(
+                success=False, message="KV control requires a fixed weight version"
+            )
         self.record_weight_version_change(new_version=recv_req.new_version)
         return UpdateWeightVersionReqOutput()
 
@@ -7035,7 +7062,9 @@ class Scheduler(
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
-            self.idle_sleeper.maybe_sleep()
+            from sglang.srt.managers.kv_control.service import sleep_on_idle
+
+            sleep_on_idle(self.idle_sleeper, self.kv_control_service)
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
         """Handle freeze_gc request: freeze scheduler's GC and forward to detokenizer."""
