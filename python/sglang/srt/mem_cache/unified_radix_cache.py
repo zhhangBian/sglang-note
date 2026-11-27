@@ -4713,6 +4713,17 @@ class UnifiedRadixCache(BasePrefixCache):
             or (self.buffer_pipeline is not None and not self.buffer_pipeline.is_idle())
         )
 
+    def has_pending_device_backup(self) -> bool:
+        """Whether an async device backup still holds device KV locks."""
+        return bool(
+            self.ongoing_write_through
+            or (
+                self.buffer_pipeline is not None
+                and self.buffer_pipeline.ongoing_write_through
+            )
+            or (self.linker is not None and self.linker.pending_offloads)
+        )
+
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""
         if self.linker is not None or self.cache_controller is None:

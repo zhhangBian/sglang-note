@@ -2095,6 +2095,10 @@ class PrefillAdder:
 
     def batch_is_full_after_rejection(self, req: Req) -> bool:
         """whether running work must finish before another admission attempt"""
+        tree_cache = getattr(self, "tree_cache", None)
+        has_pending_backup = getattr(tree_cache, "has_pending_device_backup", None)
+        if callable(has_pending_backup) and has_pending_backup() is True:
+            return False
         return bool(self.can_run_list) or not self.running_batch.is_empty()
 
     @capacity_decision
