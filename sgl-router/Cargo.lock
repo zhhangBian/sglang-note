@@ -3746,6 +3746,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sgl-kv-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sgl-router"
 version = "0.1.0"
 dependencies = [
@@ -3781,6 +3796,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sgl-kv-indexer",
+ "sgl-kv-orchestrator",
  "sglang-api-types",
  "sglang-processor",
  "sglang-runtime-v1-types",
