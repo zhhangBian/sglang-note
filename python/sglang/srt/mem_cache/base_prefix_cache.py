@@ -839,11 +839,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         they release when they end (a backup, a load-back, a prefetch)."""
         return False
 
-    def has_pending_device_backup(self) -> bool:
-        """Whether an async device-to-host backup still holds device KV locks
-        that will be released once the backup completes."""
-        return False
-
     def flush_pending_backups(self) -> None:
         """
         Submit queued host backups.

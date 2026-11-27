@@ -464,37 +464,6 @@ class TestCachedStateHitMakesProgress(unittest.TestCase):
             )
             self.assertIs(UnifiedRadixCache.transfers_in_flight(cache), not idle)
 
-    def test_pending_device_backup_distinguishes_transfer_types(self):
-        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
-        self.assertIs(BasePrefixCache.has_pending_device_backup(_cache()), False)
-        for field, pending_backup in (
-            ("ongoing_write_through", True),
-            ("buffer_pipeline.ongoing_write_through", True),
-            ("linker.pending_offloads", True),
-            ("ongoing_prefetch", False),
-            ("ongoing_backup", False),
-            ("ongoing_load_back", False),
-        ):
-            with self.subTest(transfer=field):
-                cache = SimpleNamespace(
-                    ongoing_write_through={},
-                    ongoing_prefetch={},
-                    ongoing_backup={},
-                    ongoing_load_back={},
-                    buffer_pipeline=SimpleNamespace(ongoing_write_through={}),
-                    linker=SimpleNamespace(pending_offloads={}),
-                )
-                self.assertIs(UnifiedRadixCache.has_pending_device_backup(cache), False)
-                parent, _, name = field.rpartition(".")
-                setattr(
-                    getattr(cache, parent) if parent else cache, name, {1: object()}
-                )
-                self.assertIs(
-                    UnifiedRadixCache.has_pending_device_backup(cache), pending_backup
-                )
-
     def test_an_unschedulable_refusal_reaches_the_scheduler(self):
         from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 

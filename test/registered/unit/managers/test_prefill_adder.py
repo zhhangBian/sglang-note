@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.prefill import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.req_types import FINISH_LENGTH
-from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
@@ -29,7 +29,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
-    InsertParams,
     TreeLock,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -42,8 +41,7 @@ from sglang.srt.mem_cache.prefill_budget import (
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -54,7 +52,7 @@ from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import storage_tree_slots, tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     largest_take,
@@ -210,163 +208,6 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
-
-    def test_no_token_leaves_admission_open_during_device_backup(self):
-        decode = self.create_mock_req("decode", priority=0, max_new_tokens=4)
-        waiting = self.create_mock_req("waiting", priority=0, max_new_tokens=4)
-        waiting.full_untruncated_fill_ids = [1] * 8
-        waiting.extend_end = 8
-        adder = self.create_adder(ScheduleBatch(reqs=[decode]))
-        self.mock_tree_cache.has_pending_device_backup.return_value = True
-
-        self.assertIs(adder.add_one_req(waiting, False, None), AddReqResult.NO_TOKEN)
-        self.assertFalse(adder.batch_is_full_after_rejection(waiting))
-
-        self.mock_tree_cache.has_pending_device_backup.return_value = False
-        self.assertIs(adder.add_one_req(waiting, False, None), AddReqResult.NO_TOKEN)
-        self.assertTrue(adder.batch_is_full_after_rejection(waiting))
-
-    def test_other_cache_transfers_keep_batch_full_after_rejection(self):
-        decode = self.create_mock_req("decode", priority=0, max_new_tokens=4)
-        waiting = self.create_mock_req("waiting", priority=0, max_new_tokens=4)
-        adder = self.create_adder(ScheduleBatch(reqs=[decode]))
-        self.mock_tree_cache.transfers_in_flight.return_value = True
-
-        # A default MagicMock return value is truthy. Require an explicit
-        # True to override the running batch's admission gate.
-        self.assertTrue(adder.batch_is_full_after_rejection(waiting))
-        self.mock_tree_cache.has_pending_device_backup.return_value = False
-        self.assertTrue(adder.batch_is_full_after_rejection(waiting))
-
-        adder.tree_cache = SimpleNamespace(transfers_in_flight=lambda: True)
-        self.assertTrue(adder.batch_is_full_after_rejection(waiting))
-
-    def test_scheduler_retries_prefill_when_write_through_releases_device_kv(self):
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.scheduler_components.request_list import move
-        from sglang.srt.model_executor.forward_mode import ForwardMode
-        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang.test.scheduler_test_utils import empty_request_lists
-
-        allocator = TokenToKVPoolAllocator(32, torch.float16, "cpu", None, False)
-        req_pool = ReqToTokenPool(4, 32, "cpu", enable_memory_saver=False)
-        cache = UnifiedRadixCache(
-            CacheInitParams(
-                disable=False,
-                req_to_token_pool=req_pool,
-                token_to_kv_pool_allocator=allocator,
-                page_size=1,
-                tree_slots=tree_slots_of((ComponentType.FULL,)),
-            )
-        )
-        decode = Req(
-            "decode", "", array("q", [1] * 7), SamplingParams(max_new_tokens=4)
-        )
-        decode.output_ids.append(2)
-        decode_slots = allocator.alloc(8)
-        req_pool.alloc([decode])
-        decode.kv.kv_allocated_len = len(decode_slots)
-        req_pool.write((decode.kv.req_pool_idx, slice(0, 8)), decode_slots.int())
-        running = ScheduleBatch(reqs=[decode], forward_mode=ForwardMode.DECODE)
-
-        # Model a device-to-host copy by keeping its real tree lock until the ack.
-        backup_slots = allocator.alloc(22)
-        backup_node = cache.insert(
-            InsertParams(key=RadixKey(array("q", [4] * 22)), value=backup_slots)
-        ).last_device_node
-        receipt = cache.inc_lock_ref(backup_node).to_dec_params()
-        cache._track_write_through_node(backup_node, receipt, [])
-        self.assertEqual(cache.full_evictable_size(), 0)
-
-        scheduler = Scheduler.__new__(Scheduler)
-        empty_request_lists(scheduler)
-        scheduler.grammar_manager.has_waiting_grammars = lambda: False
-        scheduler.tree_cache = cache
-        scheduler.token_to_kv_pool_allocator = allocator
-        scheduler.req_to_token_pool = req_pool
-        scheduler.policy = SchedulePolicy("fcfs", cache, True, False, False)
-        scheduler.page_size = 1
-        scheduler.max_prefill_tokens = 32
-        scheduler.chunked_prefill_size = None
-        scheduler.max_prefill_bs = 0
-        scheduler.max_running_requests = 4
-        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
-        scheduler.min_free_slots_delayer = None
-        scheduler.enable_priority_preemption = False
-        scheduler.enable_priority_scheduling = False
-        scheduler.is_hybrid_swa = False
-        scheduler.is_mixed_chunk = False
-        scheduler.enable_lora = False
-        scheduler.enable_hierarchical_cache = True
-        scheduler.enable_hicache_storage = False
-        scheduler.enable_lmcache = False
-        scheduler.enable_unified_cache_external_linker = False
-        scheduler.enable_overlap = False
-        scheduler.log_schedule_decisions = False
-        scheduler.priority_scheduling_preemption_threshold = 0
-        scheduler.truncation_align_size = None
-        scheduler.request_retirer = None
-        scheduler.processed_tokens_counter = 0
-        scheduler.model_config = SimpleNamespace(token_id_vocab_size=32)
-        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
-        scheduler.tp_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(attn_backend=None, prefill_aware_swa=False)
-        )
-        scheduler.beam_coordinator = SimpleNamespace(
-            pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
-        )
-        scheduler.load_inquirer = SimpleNamespace(_get_num_pending_tokens=lambda **_: 0)
-        scheduler.invariant_checker = MagicMock()
-        scheduler.sampler_params_pool = MagicMock()
-        scheduler.penalty_status_pool = MagicMock()
-
-        waiting = Req(
-            "waiting", "", array("q", [3] * 8), SamplingParams(max_new_tokens=4)
-        )
-        move([decode], scheduler.running_reqs)
-        move([waiting], scheduler.waiting_queue)
-
-        with (
-            get_context().override_server_args(pp_max_micro_batch_size=4),
-            patch.object(ScheduleBatch, "prepare_for_extend"),
-        ):
-            new_batch, decode_batch = scheduler._get_new_batch_prefill_raw(
-                None, running
-            )
-            self.assertIsNone(new_batch)
-            self.assertTrue(scheduler.prefill_admission_no_token)
-            self.assertFalse(running.batch_is_full)
-            self.assertEqual(list(scheduler.waiting_queue), [waiting])
-            self.assertIs(decode_batch, running)
-            self.assertEqual(running.reqs, [decode])
-
-            cache._finish_write_through_ack(backup_node)
-            self.assertEqual(cache.full_evictable_size(), 22)
-            new_batch, decode_batch = scheduler._get_new_batch_prefill_raw(
-                None, running
-            )
-            self.assertIsNotNone(new_batch)
-            self.assertEqual(new_batch.reqs, [waiting])
-            self.assertFalse(scheduler.prefill_admission_no_token)
-            self.assertFalse(running.batch_is_full)
-            self.assertFalse(scheduler.waiting_queue)
-            self.assertIs(decode_batch, running)
-            self.assertEqual(running.reqs, [decode])
-
-            # This prompt would fit an empty pool, but the decode KV still occupies it.
-            larger = Req(
-                "larger", "", array("q", [5] * 24), SamplingParams(max_new_tokens=4)
-            )
-            move([larger], scheduler.waiting_queue)
-            new_batch, decode_batch = scheduler._get_new_batch_prefill_raw(
-                None, running
-            )
-            self.assertIsNone(new_batch)
-            self.assertTrue(scheduler.prefill_admission_no_token)
-            self.assertTrue(running.batch_is_full)
-            self.assertEqual(list(scheduler.waiting_queue), [larger])
-            self.assertIs(decode_batch, running)
-            self.assertEqual(running.reqs, [decode])
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0, total_bytes=2048):
         self.mock_tree_cache.supports_mamba.return_value = False
